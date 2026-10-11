@@ -159,7 +159,7 @@ def execute_sql_query(sql_query: str) -> str:
 
 # Initialize LLM, Tools, Agent, and Pre-Processor
 llm = ChatAnthropic(
-    model=os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-5-20250929"),
+    model=os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5-5"),
     temperature=0,
 )
 tools = [vector_search_bills, execute_sql_query]

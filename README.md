@@ -40,6 +40,59 @@ Amendment refresh decisions track the latest action date separately from
 mistakenly skipped. Once a bill's amendments have been fetched, unchanged bills
 are skipped on later runs; use a full amendment refresh to process them again.
 
+### OpenFEC donor data
+
+Set `FEC_API_KEY` in the project `.env` file, then run
+`uv run python scripts/ingest_donars.py` from the repository root after the
+dbt models have been built. This creates and refreshes the
+`member_top_donors` and `member_fec_summary` tables. The summary table holds
+each member's FEC candidate ID, cycle receipts, PAC and individual
+contributions, and OpenFEC coverage end date. Candidate IDs are reused on
+subsequent runs. `member_fec_candidate_mapping` records the bioguide-to-FEC ID
+mapping, validation status, matched candidate details, and candidate options
+for manual review. Mapping uses `dbt/seeds/legislators-current.csv` as its
+primary Bioguide-to-FEC crosswalk. It checks the listed FEC candidate IDs
+against OpenFEC for the current cycle, then validates the candidate's office
+and state; matching House districts are preferred, and district mismatches are
+noted in the mapping reason. Members without FEC IDs in the crosswalk fall back
+to the existing name search, which accepts only a unique normalized
+first/last name, office, and state match. Existing matched IDs found in the
+crosswalk are reused; conflicting or unresolved mappings are refreshed from
+the crosswalk. Run
+`uv run python scripts/ingest_donars.py --mappings` to build or refresh mappings
+without fetching financial data. Mappings are rechecked every 90 days by
+default when unresolved; a matched mapping is reused and not queried again.
+Set `FEC_MAPPING_MAX_AGE_DAYS` to change the retry interval for unresolved
+mappings. Candidate
+summaries are fetched in batches. Run
+`uv run python scripts/ingest_donars.py --summaries` to refresh summaries only,
+or `uv run python scripts/ingest_donars.py --donors` for detailed employer
+aggregates only (not individual contributors). With no mode specified, both run.
+Candidates absent from a bulk-summary response remain eligible for retry. Use
+`uv run python scripts/ingest_donars.py --summary-cross-check` to fill missing
+totals from the latest available reports for the candidate's non-joint-fundraising
+committees; the source is recorded in `summary_source`.
+Use `--force` with `--donors` to replace cached employer aggregates regardless
+of the freshness window. Successfully synced
+member/cycle records are skipped for seven days by default. Set
+`DONOR_SYNC_MAX_AGE_DAYS` to change that freshness window (use `0` to force a
+refresh every run). HTTP 429 rate limits are logged to
+`logs/openfec_ingestion.log`; the run pauses cleanly, keeps completed records,
+and can be rerun later. Every run also writes a completion report to the console
+and that log, including summary candidates saved or missing, summary source,
+donor members refreshed, employer rows replaced/saved, freshness skips, and
+unmapped members. Partial runs are marked paused and report completed work.
+Requests are paced four seconds apart by default; set
+`FEC_REQUEST_INTERVAL_SECONDS` to adjust the delay. The API serves a politician's cached donor rows at
+`GET /api/politicians/{politician_id}/donors`; an optional `cycle` query
+parameter filters the results, for example
+`/api/politicians/H1/donors?cycle=2026`. Aggregate campaign finance totals
+are available at
+`GET /api/politicians/{politician_id}/donations/summary`.
+The summary response includes `summaryAvailable` and `summaryStatus`; when all
+contribution totals are null, the status is `unavailable` rather than implying
+zero contributions.
+
 The pipeline should run end-to-end. We'd recommend that you verify that before you begin making changes.
 
 > **Note:** The DuckDB database file (`dev.duckdb`) is gitignored and should not be committed.
@@ -52,8 +105,9 @@ environment and run `uv run python scripts/rag/indexer.py` from the repository
 root. The indexer hashes chunk content and metadata, embeds only new or changed
 chunks, and removes vectors absent from the current dbt view. Its first run
 rebuilds legacy/incompatible embedding tables; later runs are incremental.
-Running `scripts/rag/agent.py` for searches also requires `ANTHROPIC_API_KEY`
-for its chat model. Override the default Claude model with `ANTHROPIC_MODEL`.
+Running `scripts/rag/agent.py` for searches also requires `ANTHROPIC_API_KEY`.
+Override the agent's Claude model with `ANTHROPIC_MODEL` or the router's
+classification model with `ANTHROPIC_ROUTER_MODEL`.
 The SQL tool limits responses to 50 rows and 12,000 characters, truncating long
 cells; for count-and-example questions, the agent is instructed to combine the
 aggregate and a small sample in one query.

@@ -49,37 +49,45 @@ class CommentRequest(BaseModel):
 
 @app.get("/api/politicians")
 def get_politicians(state: Optional[str] = None, chamber: Optional[str] = None):
-    """Fetch politician directory directly from DuckDB mart_legislative_activity."""
+    """Fetch the member directory and attach legislative activity counts."""
     conn = duckdb.connect(str(DB_PATH), read_only=True)
 
     where_clauses = ["1=1"]
     params = []
 
     if state and state.upper() != "ALL":
-        where_clauses.append("target_member_state_code = ?")
+        where_clauses.append("members.state_code = ?")
         params.append(state.upper())
 
     normalized_chamber = CHAMBER_ALIASES.get((chamber or "").strip().casefold())
     if normalized_chamber:
-        where_clauses.append("LOWER(TRIM(target_member_chamber)) = ?")
+        where_clauses.append("LOWER(TRIM(members.chamber)) = ?")
         params.append(normalized_chamber)
 
     where_sql = " AND ".join(where_clauses)
 
     sql = f"""
         SELECT 
-            target_member_id AS id,
-            target_member_name AS name,
-            target_member_state_code AS state,
-            target_member_state AS stateName,
-            target_member_chamber AS chamber,
-            target_member_party AS party,
-            COUNT(DISTINCT CASE WHEN relationship = 'sponsor' THEN bill_id END) AS sponsoredCount,
-            COUNT(DISTINCT CASE WHEN relationship = 'cosponsor' THEN bill_id END) AS cosponsoredCount
-        FROM mart_legislative_activity
+            members.member_id AS id,
+            members.member_name AS name,
+            members.state_code AS state,
+            members.state_name AS stateName,
+            members.chamber AS chamber,
+            members.party_name AS party,
+            COALESCE(activity.sponsored_count, 0) AS sponsoredCount,
+            COALESCE(activity.cosponsored_count, 0) AS cosponsoredCount
+        FROM main.stg_members AS members
+        LEFT JOIN (
+            SELECT
+                target_member_id,
+                COUNT(DISTINCT CASE WHEN relationship = 'sponsor' THEN bill_id END) AS sponsored_count,
+                COUNT(DISTINCT CASE WHEN relationship = 'cosponsor' THEN bill_id END) AS cosponsored_count
+            FROM main.mart_legislative_activity
+            GROUP BY target_member_id
+        ) AS activity
+            ON members.member_id = activity.target_member_id
         WHERE {where_sql}
-        GROUP BY 1, 2, 3, 4, 5, 6
-        ORDER BY name ASC
+        ORDER BY members.member_name ASC
         LIMIT 100;
     """
 
@@ -91,6 +99,136 @@ def get_politicians(state: Optional[str] = None, chamber: Optional[str] = None):
         conn.close()
         raise HTTPException(status_code=500, detail=f"Database Query Error: {str(e)}")
 
+
+@app.get("/api/politicians/{politician_id}/donors")
+def get_politician_donors(politician_id: str, cycle: Optional[int] = None):
+    """Fetch cached OpenFEC top contributors for a politician."""
+    conn = duckdb.connect(str(DB_PATH), read_only=True)
+    try:
+        donor_table = conn.execute("""
+            SELECT COUNT(*)
+            FROM information_schema.tables
+            WHERE table_schema = 'main' AND table_name = 'member_top_donors'
+        """).fetchone()[0]
+        if not donor_table:
+            raise HTTPException(
+                status_code=503,
+                detail="Donor data is not available; run the OpenFEC donor ingestion first.",
+            )
+
+        sql = """
+            SELECT donor_name AS donorName, amount, industry, cycle
+            FROM main.member_top_donors
+            WHERE bioguide_id = ?
+        """
+        params = [politician_id]
+        if cycle is not None:
+            sql += " AND cycle = ?"
+            params.append(str(cycle))
+        sql += " ORDER BY amount DESC, donor_name ASC"
+        return conn.execute(sql, params).fetchdf().to_dict(orient="records")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Donor Query Error: {str(e)}"
+        )
+    finally:
+        conn.close()
+
+
+@app.get("/api/politicians/{politician_id}/donations/summary")
+def get_politician_donation_summary(politician_id: str):
+    """Fetch aggregate OpenFEC campaign finance totals for a politician."""
+    conn = duckdb.connect(str(DB_PATH), read_only=True)
+    try:
+        summary_table = conn.execute("""
+            SELECT COUNT(*)
+            FROM information_schema.tables
+            WHERE table_schema = 'main' AND table_name = 'member_fec_summary'
+        """).fetchone()[0]
+        if not summary_table:
+            raise HTTPException(
+                status_code=503,
+                detail="Donation summary data is not available; run the OpenFEC summary ingestion first.",
+            )
+
+        row = conn.execute(
+            """
+            SELECT fec_candidate_id, total_receipts, pac_contributions,
+                   individual_contributions, coverage_end_date
+            FROM main.member_fec_summary
+            WHERE bioguide_id = ?
+            """,
+            [politician_id],
+        ).fetchone()
+        if row is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No donation summary found for politician {politician_id}.",
+            )
+
+        summary_available = any(value is not None for value in row[1:4])
+        return {
+            "fecCandidateId": row[0],
+            "totalReceipts": row[1],
+            "pacContributions": row[2],
+            "individualContributions": row[3],
+            "coverageEndDate": row[4],
+            "summaryAvailable": summary_available,
+            "summaryStatus": "available" if summary_available else "unavailable",
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Donation Summary Query Error: {str(e)}"
+        )
+    finally:
+        conn.close()
+
+@app.get("/api/politicians/{bioguide_id}/bills")
+def get_politician_key_bills(bioguide_id: str) -> List[Dict[str, Any]]:
+    """Fetch top sponsored and cosponsored bills dynamically from DuckDB for a member."""
+    if not DB_PATH.exists():
+        raise HTTPException(status_code=500, detail=f"DuckDB database file not found at: {DB_PATH}")
+
+    conn = duckdb.connect(str(DB_PATH), read_only=True)
+
+    sql = """
+          SELECT DISTINCT
+              activity_id AS id,
+              coalesce(bill_title, activity_title) AS title,
+              relationship AS type,
+              bill_status AS statusCategory,
+              bill_latest_action_text AS latestAction,
+              bill_latest_action_date AS actionDate
+          FROM mart_legislative_activity
+          WHERE target_member_id = ?
+            AND activity_type = 'bill'
+          ORDER BY
+              CASE WHEN relationship = 'sponsor' THEN 1 ELSE 2 END,
+              bill_latest_action_date DESC
+              LIMIT 10; \
+          """
+
+    try:
+        df = conn.execute(sql, [bioguide_id]).fetchdf()
+        conn.close()
+
+        # Handle null values gracefully
+        df = df.fillna({
+            "title": "Untitled Bill",
+            "type": "cosponsor",
+            "statusCategory": "Introduced",
+            "latestAction": "No recent action recorded",
+            "actionDate": ""
+        })
+
+        return df.to_dict(orient="records")
+    except Exception as e:
+        conn.close()
+        raise HTTPException(status_code=500, detail=f"DuckDB Query Error: {str(e)}")
 # -------------------------------------------------------------------
 # 2. RAG AGENT EXECUTION ENDPOINT
 # -------------------------------------------------------------------

@@ -109,6 +109,7 @@ def create_tables(db, replace: bool = False, replace_tables: list[str] | None = 
         )
     """)
 
+
     amendment_state_stmt = (
         "CREATE OR REPLACE TABLE"
         if replace and "raw_amendments" in tables_to_replace

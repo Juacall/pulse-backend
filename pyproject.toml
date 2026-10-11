@@ -9,6 +9,7 @@ dependencies = [
     "dbt-duckdb>=1.10.1",
     "duckdb",
     "fastapi>=0.143.0",
+    "fastapi-cache2[inmemory]>=0.2.2",
     "httpx>=0.28.1",
     "langchain>=1.0.0",
     "langchain-anthropic>=1.7.5",

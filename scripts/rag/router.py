@@ -1,4 +1,5 @@
 # scripts/rag/router.py
+import os
 from typing import Literal, Optional
 from pydantic import BaseModel, Field
 from langchain_anthropic import ChatAnthropic
@@ -25,7 +26,10 @@ class QueryAnalysis(BaseModel):
 
 # 2. Build Query Router Class
 class PreProcessingRouter:
-    def __init__(self, model_name: str = "claude-3-5-haiku-latest"):
+    def __init__(self, model_name: Optional[str] = None):
+        model_name = model_name or os.environ.get(
+            "ANTHROPIC_ROUTER_MODEL", "claude-haiku-5-5"
+        )
         llm = ChatAnthropic(model=model_name, temperature=0)
         self.structured_llm = llm.with_structured_output(QueryAnalysis)
 
