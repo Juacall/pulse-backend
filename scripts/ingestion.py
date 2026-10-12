@@ -111,6 +111,7 @@ def load_bills(db, bills, member_id, relationship):
         bill_type = b.get("type")
         bill_number = str(b.get("number"))
         title = b.get("title")
+        introduced_date = b.get("introducedDate")
         update_date = b.get("updateDate") or b.get("updateDateIncludingText")
 
         # Current bill status: the Congress API exposes the most-recent action
@@ -122,12 +123,12 @@ def load_bills(db, bills, member_id, relationship):
 
         row_hash = _compute_hash(
             congress, bill_type, bill_number, title, member_id, relationship,
-            latest_action_date, latest_action_text
+            introduced_date, latest_action_date, latest_action_text
         )
         rows.append((
             congress, bill_type, bill_number, title,
-            latest_action_date, latest_action_text, member_id, relationship,
-            update_date, row_hash, now_iso
+            introduced_date, latest_action_date, latest_action_text,
+            member_id, relationship, update_date, row_hash, now_iso
         ))
 
     existing_hashes = {}
@@ -154,23 +155,24 @@ def load_bills(db, bills, member_id, relationship):
 
     inserted = updated = unchanged = 0
     for row in rows:
-        key = (row[0], row[1], row[2], row[6], row[7])
+        key = (row[0], row[1], row[2], row[7], row[8])
         existing_hash = existing_hashes.get(key)
         if existing_hash is None:
             inserted += 1
-        elif existing_hash != row[9]:
+        elif existing_hash != row[10]:
             updated += 1
         else:
             unchanged += 1
 
     db.executemany("""
         INSERT INTO main.raw_bills (
-            congress, bill_type, bill_number, title,
+            congress, bill_type, bill_number, title, introduced_date,
             latest_action_date, latest_action_text, member_id, relationship,
             update_date, row_hash, ingested_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT (congress, bill_type, bill_number, member_id, relationship) DO UPDATE SET
             title = EXCLUDED.title,
+            introduced_date = EXCLUDED.introduced_date,
             latest_action_date = EXCLUDED.latest_action_date,
             latest_action_text = EXCLUDED.latest_action_text,
             update_date = EXCLUDED.update_date,

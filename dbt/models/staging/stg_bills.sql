@@ -28,6 +28,7 @@ select
         when 'HCONRES' then 'House Concurrent Resolution'
         else upper(trim(bill_type))
     end                                     as bill_type_label,
+    try_cast(introduced_date as date)       as bill_introduced_date,
     -- current status (point-in-time snapshot)
     try_cast(latest_action_date as date)    as bill_latest_action_date,
     nullif(trim(latest_action_text), '')    as bill_latest_action_text,
@@ -63,6 +64,8 @@ where
     and bill_number is not null
     and trim(bill_number) != ''
     and congress is not null
-    and upper(trim(bill_type)) in ('HR', 'HRES', 'HJRES', 'HCONRES')
+    and upper(trim(bill_type)) in (
+        'HR', 'HRES', 'HJRES', 'HCONRES',
+        'S', 'SRES', 'SJRES', 'SCONRES'
+    )
     and lower(trim(relationship)) in ('sponsor', 'cosponsor')
-

@@ -11,6 +11,7 @@ from threading import Barrier
 from unittest.mock import patch
 
 import pytest
+import duckdb
 
 # Add scripts directory to path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
@@ -56,6 +57,34 @@ def test_table_existence_validation():
 
     # Non-existent table should return False
     assert check_tables_exist(db, ["non_existent_table"]) is False
+    db.close()
+
+
+def test_create_tables_adds_introduced_date_to_existing_raw_bills():
+    db = duckdb.connect(":memory:")
+    db.execute("""
+        CREATE TABLE main.raw_bills (
+            congress INTEGER,
+            bill_type VARCHAR,
+            bill_number VARCHAR,
+            title VARCHAR,
+            latest_action_date VARCHAR,
+            latest_action_text VARCHAR,
+            member_id VARCHAR,
+            relationship VARCHAR,
+            update_date TIMESTAMP,
+            row_hash VARCHAR,
+            ingested_at TIMESTAMP,
+            PRIMARY KEY (congress, bill_type, bill_number, member_id, relationship)
+        )
+    """)
+
+    create_tables(db, replace=False)
+
+    columns = {
+        row[0] for row in db.execute("DESCRIBE main.raw_bills").fetchall()
+    }
+    assert "introduced_date" in columns
     db.close()
 
 
@@ -185,6 +214,10 @@ def test_bills_ingestion_and_relationship():
     # Check cosponsored bill
     b2 = rows[1]
     assert b2 == (119, "HR", "102", "Border Security Acceleration Act", bid, "cosponsor")
+    introduced_dates = db.execute(
+        "SELECT bill_number, introduced_date FROM main.raw_bills ORDER BY bill_number"
+    ).fetchall()
+    assert introduced_dates == [("101", "2025-01-03"), ("102", "2025-01-04")]
     db.close()
 
 

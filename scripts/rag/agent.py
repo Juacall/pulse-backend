@@ -3,12 +3,20 @@ import os
 from pathlib import Path
 from typing import Optional
 
+from scripts.rag.environment import (
+    anthropic_workspace_headers,
+    load_project_environment,
+)
+
+load_project_environment()
+
 import duckdb
+from pydantic import BaseModel, Field
 from langchain.agents import create_agent
 from langchain_anthropic import ChatAnthropic
 from langchain_core.tools import tool
 from langchain_voyageai import VoyageAIEmbeddings
-
+from typing import List, Dict, Any, Optional, Literal
 from scripts.rag.router import PreProcessingRouter
 
 DB_PATH = Path(__file__).resolve().parents[2] / "dev.duckdb"
@@ -16,6 +24,34 @@ EMBEDDING_DIMENSIONS = 512
 MAX_SQL_RESULT_ROWS = 50
 MAX_SQL_CELL_CHARACTERS = 1_000
 MAX_SQL_OUTPUT_CHARACTERS = 12_000
+
+
+class DataResultPayload(BaseModel):
+    display_type: Literal["metric", "table", "list", "text"] = Field(
+        description=(
+            "Type of UI element to render:\n"
+            "- 'metric': Single key performance indicators or counts.\n"
+            "- 'table': Multi-column tabular data.\n"
+            "- 'list': Key-value or bullet-point summaries.\n"
+            "- 'text': Pure narrative answers."
+        )
+    )
+    title: Optional[str] = Field(default=None, description="Header text for the UI card.")
+    summary: Optional[str] = Field(default=None, description="Detailed text explanation or takeaway.")
+    columns: Optional[List[str]] = Field(
+        default=None,
+        description="List of column headers for 'table' display type (e.g. ['Bill ID', 'Title', 'Status'])."
+    )
+    rows: Optional[List[Dict[str, Any]]] = Field(
+        default=None,
+        description=(
+            "Data rows matching the display type:\n"
+            "• CRITICAL FOR 'metric': Must be a list with a dict formatted exactly like:\n"
+            "  [{'label': 'Total Sponsored Bills', 'value': '323', 'subtext': 'WA Delegation'}]\n"
+            "• FOR 'table': List of dicts keyed by column names e.g. [{'Bill ID': 'HR-123', ...}]\n"
+            "• FOR 'list': List of dicts e.g. [{'title': 'Key Focus', 'description': '...'}]"
+        )
+    )
 
 
 def _format_query_result(columns, rows, *, rows_truncated=False) -> str:
@@ -160,22 +196,45 @@ def execute_sql_query(sql_query: str) -> str:
 # Initialize LLM, Tools, Agent, and Pre-Processor
 llm = ChatAnthropic(
     model=os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5-5"),
-    temperature=0,
+    default_headers=anthropic_workspace_headers(),
 )
 tools = [vector_search_bills, execute_sql_query]
 agent_executor = create_agent(
     llm,
     tools,
-    system_prompt=(
-        "Answer legislative data questions using the available tools. "
-        "For a request combining an aggregate and examples, prefer one SQL "
-        "query that returns the aggregate alongside a small representative "
-        "sample; do not issue separate exploratory count and listing queries. "
-        "For bill counts, deduplicate by bill_id because mart rows repeat by "
-        "member and county. Keep SQL result requests narrow and respect the "
-        "tool's truncation notice. "
-        "When performing semantic vector search for a specific state, pass the 2-letter uppercase "
-        "state_code parameter to `vector_search_bills`."
+    response_format = DataResultPayload,
+    system_prompt = (
+        "Answer legislative data questions using the available tools.\n\n"
+        "QUERY EXECUTION & SQL GUIDELINES:\n"
+        "- For requests combining an aggregate and examples, prefer one SQL query "
+        "returning the aggregate alongside a small representative sample; do not "
+        "issue separate exploratory count and listing queries.\n"
+        "- Deduplicate bill counts by bill_id because mart rows repeat by member and county.\n"
+        "- Keep SQL result requests narrow and respect the tool's truncation notice.\n"
+        "- When performing semantic vector search for a specific state, pass the 2-letter uppercase "
+        "state_code parameter to `vector_search_bills`.\n\n"
+        "STATE FILTERING RULES (DuckDB mart_legislative_activity):\n"
+        "- Use `target_member_state_code = 'WA'` for 2-letter postal codes ('WA', 'CA', 'NY').\n"
+        "- Use `target_member_state = 'WASHINGTON'` if filtering on full uppercase state names.\n"
+        "- NEVER filter `target_member_state = 'WA'` (this column holds full names, so it will return 0 rows).\n\n"
+        "RESPONSE FORMATTING CONTRACT (DataResultPayload):\n"
+        "1. METRIC RESPONSES (display_type='metric'):\n"
+        "   - NEVER output empty dicts [{}] in rows.\n"
+        "   - MUST include rows: [{'label': '<Title/Metric Name>', 'value': '<Number>', 'subtext': '<Context>'}]\n\n"
+        "2. TABLE RESPONSES (display_type='table'):\n"
+        "   - NEVER output empty dicts [{}] in rows.\n"
+        "   - Every dict in `rows` MUST contain key-value pairs corresponding to your `columns`.\n"
+        "   - Limit `rows` to 5-10 representative items to avoid output truncation or empty objects.\n\n"
+        "3. QUALITATIVE RESPONSES (display_type='text' or 'list'):\n"
+        "   - Use 'text' or 'list' when no tabular rows exist."
+        "2. BILL LISTINGS / TABULAR SEARCHES:\n"
+        "   - Set display_type = 'table'.\n"
+        "   - NEVER put raw bill lists or bulleted status breakdowns solely inside 'summary'.\n"
+        "   - Populate 'columns' with key fields (e.g. ['Bill ID', 'Title', 'Status', 'Latest Action Date', 'Theme']).\n"
+        "   - Populate 'rows' with representative bill dicts (e.g. S-160, HR-3922, S-1462, HR-345).\n"
+        "   - Put dataset scope notes (e.g. 'Federal HR/S bills only, no state AB/SB') and overall thematic takeaways in 'summary'.\n\n"
+        "3. QUALITATIVE OVERVIEWS:\n"
+        "   - Set display_type = 'list' or 'text' ONLY when no structured numbers or tabular rows exist."
     ),
 )
 router = PreProcessingRouter()

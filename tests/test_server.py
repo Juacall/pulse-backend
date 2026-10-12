@@ -1,11 +1,88 @@
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
 import duckdb
+from unittest.mock import Mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from scripts.server import server
+
+#
+# def test_chat_hides_router_details_and_requests_concise_answer_by_default(
+#     monkeypatch,
+# ):
+#     analysis = SimpleNamespace(
+#         intent="SQL_AGGREGATION",
+#         state_code="WA",
+#         rewritten_prompt="Count sponsored bills for Washington.",
+#     )
+#     monkeypatch.setattr(server.router, "process", lambda query: analysis)
+#     captured = {}
+#
+#     def invoke(payload):
+#         captured.update(payload)
+#         return {"messages": [SimpleNamespace(content="Members sponsored 323 bills.")]}
+#
+#     monkeypatch.setattr(server.agent_executor, "invoke", invoke)
+#
+#     result = server.chat_with_agent(server.ChatRequest(query="How many?"))
+#
+#     assert result == {"synthesizedAnswer": "Members sponsored 323 bills."}
+#     prompt = captured["messages"][0][1]
+#     assert "Return the direct answer only" in prompt
+#     assert "Do not describe internal SQL" in prompt
+#
+#
+# def test_chat_includes_router_details_when_debug_is_enabled(monkeypatch):
+#     analysis = SimpleNamespace(
+#         intent="SQL_AGGREGATION",
+#         state_code="WA",
+#         rewritten_prompt="Count sponsored bills for Washington.",
+#     )
+#     monkeypatch.setattr(server.router, "process", lambda query: analysis)
+#     captured = {}
+#
+#     def invoke(payload):
+#         captured.update(payload)
+#         return {"messages": [SimpleNamespace(content="Members sponsored 323 bills.")]}
+#
+#     monkeypatch.setattr(server.agent_executor, "invoke", invoke)
+#
+#     result = server.chat_with_agent(
+#         server.ChatRequest(query="How many?", debug=True)
+#     )
+#
+#     assert result == {
+#         "synthesizedAnswer": "Members sponsored 323 bills.",
+#         "routerAnalysis": {
+#             "intent": "SQL_AGGREGATION",
+#             "detectedState": "WA",
+#             "rewrittenPrompt": "Count sponsored bills for Washington.",
+#         },
+#     }
+#     assert "Debug mode is enabled" in captured["messages"][0][1]
+
+
+def test_chat_reports_invalid_anthropic_key_as_service_unavailable(monkeypatch):
+    monkeypatch.setattr(
+        server.router,
+        "process",
+        Mock(side_effect=server.AnthropicAuthenticationError(
+            message="invalid x-api-key",
+            response=Mock(),
+            body={"error": "invalid x-api-key"},
+        )),
+    )
+
+    try:
+        server.chat_with_agent(server.ChatRequest(query="How many bills?"))
+    except server.HTTPException as error:
+        assert error.status_code == 503
+        assert "ANTHROPIC_API_KEY" in error.detail
+    else:
+        raise AssertionError("Expected an invalid Anthropic key to return 503")
 
 
 def _create_politicians_db(path):
@@ -31,17 +108,17 @@ def _create_politicians_db(path):
             ("S1", "Senate Member", "WA", "WASHINGTON", "Senate", "Party B"),
         ],
     )
-    conn.execute(
-        """
-        CREATE TABLE mart_legislative_activity (
-            target_member_id VARCHAR,
-            relationship VARCHAR,
-            bill_id VARCHAR
+    conn.execute("""
+        CREATE TABLE dim_members (
+            bioguide_id VARCHAR PRIMARY KEY,
+            sponsored_count INTEGER,
+            cosponsored_count INTEGER,
+            enacted_count INTEGER,
+            pass_rate DOUBLE
         )
-        """
-    )
+    """)
     conn.execute(
-        "INSERT INTO mart_legislative_activity VALUES ('H1', 'sponsor', 'HR1')"
+        "INSERT INTO dim_members VALUES ('H1', 10, 20, 2, 20.0)"
     )
     conn.close()
 
@@ -57,6 +134,9 @@ def test_politicians_chamber_filter_normalizes_request_and_stored_value(
         politicians = server.get_politicians(chamber=chamber)
         assert [politician["id"] for politician in politicians] == ["S1"]
         assert politicians[0]["sponsoredCount"] == 0
+        assert politicians[0]["cosponsoredCount"] == 0
+        assert politicians[0]["enactedCount"] == 0
+        assert politicians[0]["passRate"] is None
 
 
 def test_politicians_without_chamber_filter_returns_all_members(
@@ -69,6 +149,11 @@ def test_politicians_without_chamber_filter_returns_all_members(
     politicians = server.get_politicians()
 
     assert {politician["id"] for politician in politicians} == {"H1", "S1"}
+    house_member = next(member for member in politicians if member["id"] == "H1")
+    assert house_member["sponsoredCount"] == 10
+    assert house_member["cosponsoredCount"] == 20
+    assert house_member["enactedCount"] == 2
+    assert house_member["passRate"] == 20.0
 
 
 def test_politicians_all_chambers_filter_includes_senate_members(
@@ -81,6 +166,39 @@ def test_politicians_all_chambers_filter_includes_senate_members(
     politicians = server.get_politicians(state="WA", chamber="ALL")
 
     assert {politician["id"] for politician in politicians} == {"H1", "S1"}
+
+
+def test_politician_bills_includes_introduced_date(tmp_path, monkeypatch):
+    db_path = tmp_path / "bills.duckdb"
+    conn = duckdb.connect(str(db_path))
+    conn.execute("""
+        CREATE TABLE mart_legislative_activity (
+            target_member_id VARCHAR,
+            activity_type VARCHAR,
+            activity_id VARCHAR,
+            bill_title VARCHAR,
+            activity_title VARCHAR,
+            relationship VARCHAR,
+            bill_status VARCHAR,
+            bill_introduced_date DATE,
+            bill_latest_action_text VARCHAR,
+            bill_latest_action_date DATE
+        )
+    """)
+    conn.execute("""
+        INSERT INTO mart_legislative_activity VALUES (
+            'H1', 'bill', 'HR-101', 'Example bill', 'Example bill',
+            'sponsor', 'In Committee', DATE '2025-01-03',
+            'Referred to committee', DATE '2025-02-01'
+        )
+    """)
+    conn.close()
+    monkeypatch.setattr(server, "DB_PATH", db_path)
+
+    bills = server.get_politician_key_bills("H1")
+
+    assert bills[0]["introducedDate"] == "2025-01-03"
+    assert str(bills[0]["actionDate"])[:10] == "2025-02-01"
 
 
 def test_politician_donors_returns_donors_and_filters_by_cycle(

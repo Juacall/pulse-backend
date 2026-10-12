@@ -82,6 +82,7 @@ def create_tables(db, replace: bool = False, replace_tables: list[str] | None = 
             bill_type           VARCHAR,
             bill_number         VARCHAR,
             title               VARCHAR,
+            introduced_date     VARCHAR,
             latest_action_date  VARCHAR,
             latest_action_text  VARCHAR,
             member_id           VARCHAR,
@@ -92,6 +93,9 @@ def create_tables(db, replace: bool = False, replace_tables: list[str] | None = 
             PRIMARY KEY (congress, bill_type, bill_number, member_id, relationship)
         )
     """)
+    db.execute(
+        "ALTER TABLE main.raw_bills ADD COLUMN IF NOT EXISTS introduced_date VARCHAR"
+    )
     db.execute(f"""
         {create_stmt("raw_amendments")} main.raw_amendments (
             congress          INTEGER,

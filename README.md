@@ -39,6 +39,10 @@ Amendment refresh decisions track the latest action date separately from
 `raw_bills`, so loading bills first does not cause their amendments to be
 mistakenly skipped. Once a bill's amendments have been fetched, unchanged bills
 are skipped on later runs; use a full amendment refresh to process them again.
+Bill ingestion stores the Congress API's `introducedDate` from the existing
+sponsored/cosponsored legislation response; the politician bills endpoint
+returns it as `introducedDate`. Existing databases gain the nullable raw column
+automatically when ingestion initializes its schema.
 
 ### OpenFEC donor data
 
@@ -92,6 +96,13 @@ are available at
 The summary response includes `summaryAvailable` and `summaryStatus`; when all
 contribution totals are null, the status is `unavailable` rather than implying
 zero contributions.
+The politician directory returns sponsored, cosponsored, and enacted bill
+counts plus `passRate` from `dim_members`. The rate is null when no sponsored
+bills are present in the data, rather than reporting a misleading zero percent.
+Chat responses return only `synthesizedAnswer` by default and avoid commentary
+about internal SQL choices. Send `"debug": true` in the `/api/chat` request body
+to include `routerAnalysis` and request a brief explanation of the data/query
+approach.
 
 The pipeline should run end-to-end. We'd recommend that you verify that before you begin making changes.
 
@@ -105,9 +116,13 @@ environment and run `uv run python scripts/rag/indexer.py` from the repository
 root. The indexer hashes chunk content and metadata, embeds only new or changed
 chunks, and removes vectors absent from the current dbt view. Its first run
 rebuilds legacy/incompatible embedding tables; later runs are incremental.
-Running `scripts/rag/agent.py` for searches also requires `ANTHROPIC_API_KEY`.
-Override the agent's Claude model with `ANTHROPIC_MODEL` or the router's
-classification model with `ANTHROPIC_ROUTER_MODEL`.
+The RAG agent loads `ANTHROPIC_API_KEY` from the project-root `.env` before
+initializing Anthropic clients; that file's key overrides a process-level
+`ANTHROPIC_API_KEY`. Both Anthropic clients send the configured
+`anthropic-workspace-id` header, defaulting to the workspace ID used by this
+project; set `ANTHROPIC_WORKSPACE_ID` to override it. Override the agent's
+Claude model with `ANTHROPIC_MODEL` or the router's classification model with
+`ANTHROPIC_ROUTER_MODEL`.
 The SQL tool limits responses to 50 rows and 12,000 characters, truncating long
 cells; for count-and-example questions, the agent is instructed to combine the
 aggregate and a small sample in one query.

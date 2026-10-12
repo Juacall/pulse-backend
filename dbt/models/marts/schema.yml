@@ -1,6 +1,16 @@
 version: 2
 
 models:
+  - name: dim_members
+    description: One row per member with pre-aggregated sponsored, cosponsored, enacted, and pass-rate metrics.
+    columns:
+      - name: bioguide_id
+        description: Unique member identifier.
+        data_tests:
+          - unique
+          - not_null
+      - name: pass_rate
+        description: Percentage of sponsored bills enacted, rounded to one decimal place; null when the member has no sponsored bills.
   - name: mart_legislative_activity
     columns:
       - name: target_member_state
@@ -19,3 +29,5 @@ models:
                   - cosponsor
                   - amendment_sponsor
                   - sponsored bill received amendment
+      - name: bill_introduced_date
+        description: Date the bill was introduced, from the Congress.gov API.

@@ -78,6 +78,7 @@ MOCK_SPONSORED_BILLS = [
         "type": "HR",
         "number": "101",
         "title": "Protect American Energy Act",
+        "introducedDate": "2025-01-03",
         "updateDate": "2025-02-01T10:00:00Z",
         "latestAction": {
             "actionDate": "2025-02-01",
@@ -92,6 +93,7 @@ MOCK_COSPONSORED_BILLS = [
         "type": "HR",
         "number": "102",
         "title": "Border Security Acceleration Act",
+        "introducedDate": "2025-01-04",
         "updateDate": "2025-02-02T11:00:00Z",
         "latestAction": {
             "actionDate": "2025-02-02",

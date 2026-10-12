@@ -1,9 +1,18 @@
 # scripts/rag/router.py
 import os
 from typing import Literal, Optional
+
+from scripts.rag.environment import (
+    anthropic_workspace_headers,
+    load_project_environment,
+)
+
+load_project_environment()
+
 from pydantic import BaseModel, Field
 from langchain_anthropic import ChatAnthropic
 from langchain_core.prompts import ChatPromptTemplate
+
 
 # 1. Define Structured Output Schema
 class QueryAnalysis(BaseModel):
@@ -24,13 +33,19 @@ class QueryAnalysis(BaseModel):
         description="Refined and explicit version of the user prompt incorporating normalized state codes, exact column targets, and specific instructions for tool sequencing."
     )
 
+
+
+
 # 2. Build Query Router Class
 class PreProcessingRouter:
     def __init__(self, model_name: Optional[str] = None):
         model_name = model_name or os.environ.get(
             "ANTHROPIC_ROUTER_MODEL", "claude-haiku-5-5"
         )
-        llm = ChatAnthropic(model=model_name, temperature=0)
+        llm = ChatAnthropic(
+            model=model_name,
+            default_headers=anthropic_workspace_headers(),
+        )
         self.structured_llm = llm.with_structured_output(QueryAnalysis)
 
         self.prompt = ChatPromptTemplate.from_messages([
@@ -38,9 +53,9 @@ class PreProcessingRouter:
 Your task is to convert raw user questions into clean, structured parameters and augmented execution instructions.
 
 Rules:
-1. Map full state/territory names to 2-letter uppercase postal abbreviations (e.g., Washington -> WA, California -> CA, District of Columbia -> DC).
-2. For SQL metrics (counts, bills sponsored, status checks), table `mart_legislative_activity` uses `target_member_state` with 2-letter codes ('WA', 'NY') and `relationship` values like 'sponsor' or 'cosponsor'.
-3. Generate a `rewritten_prompt` that gives clear, step-by-step instructions to the agent based on the query intent.
+    "1. Map full state/territory names to 2-letter uppercase postal abbreviations (e.g., Washington -> WA, California -> CA, District of Columbia -> DC).",
+    "2. For SQL metrics (counts, bills sponsored, status checks), table `mart_legislative_activity` uses `target_member_state_code` for 2-letter codes ('WA', 'NY') and `target_member_state` for full state names ('WASHINGTON', 'NEW YORK'). Always filter 2-letter codes against `target_member_state_code`.",
+    "3. Generate a `rewritten_prompt` that gives clear, step-by-step instructions to the agent based on the query intent.",
 """),
             ("user", "{user_input}")
         ])

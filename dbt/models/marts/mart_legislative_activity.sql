@@ -49,6 +49,7 @@ select
     la.bill_title,                              -- parent bill title for both bills and amendments
 -- Current status of the (parent) bill — snapshot, no history
     la.bill_status,                            -- coarse category for aggregation
+    la.bill_introduced_date,
     la.bill_latest_action_date,                -- date of the most-recent action
     la.bill_latest_action_text,                -- full text of the most-recent action
     la.amendment_id,

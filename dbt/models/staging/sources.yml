@@ -52,6 +52,8 @@ sources:
             description: Bill number within its type.
           - name: title
             description: Official bill title.
+          - name: introduced_date
+            description: Date the bill was introduced, from introducedDate on the Congress API member legislation endpoint.
           - name: latest_action_date
             description: >
               Date of the bill's most-recent action (from latestAction.actionDate).

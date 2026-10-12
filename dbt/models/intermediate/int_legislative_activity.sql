@@ -39,6 +39,7 @@ with bills as (
         bill_type,
         bill_number,
         bill_status                         as bill_status,
+        bill_introduced_date                as bill_introduced_date,
         bill_latest_action_date             as bill_latest_action_date,
         bill_latest_action_text             as bill_latest_action_text
     from {{ ref('stg_bills') }}
@@ -61,6 +62,7 @@ amendments as (
         a.bill_type,
         a.bill_number,
         b.bill_status                       as bill_status,
+        b.bill_introduced_date              as bill_introduced_date,
         b.bill_latest_action_date           as bill_latest_action_date,
         b.bill_latest_action_text           as bill_latest_action_text
     from {{ ref('stg_amendments') }} as a
@@ -97,6 +99,7 @@ select
     bill_type,
     bill_number,
     bill_status,
+    bill_introduced_date,
     bill_latest_action_date,
     bill_latest_action_text
 from unmerged
