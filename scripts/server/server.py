@@ -16,6 +16,7 @@ from scripts.server.cache import cache
 
 # Import your existing agent & router modules
 from scripts.rag.agent import agent_executor, DB_PATH, DataResultPayload
+from scripts.rag.database import connect_duckdb, database_label
 from scripts.rag.router import PreProcessingRouter, QueryAnalysis
 
 app = FastAPI(title="Pulse API", version="1.0.0")
@@ -41,15 +42,14 @@ def get_db_cursor() -> duckdb.DuckDBPyConnection:
     """Return a per-request cursor on the worker's shared read-only DuckDB connection."""
     global _duckdb_conn, _duckdb_path
     with _duckdb_lock:
-        if _duckdb_conn is None or _duckdb_path != str(DB_PATH):
-            if not DB_PATH.exists():
-                raise HTTPException(
-                    status_code=500, detail=f"DuckDB database file not found at: {DB_PATH}"
-                )
+        if _duckdb_conn is None or _duckdb_path != database_label(DB_PATH):
             if _duckdb_conn is not None:
                 _duckdb_conn.close()
-            _duckdb_conn = duckdb.connect(str(DB_PATH), read_only=True)
-            _duckdb_path = str(DB_PATH)
+            try:
+                _duckdb_conn = connect_duckdb(DB_PATH)
+            except FileNotFoundError as e:
+                raise HTTPException(status_code=500, detail=str(e))
+            _duckdb_path = database_label(DB_PATH)
         return _duckdb_conn.cursor()
 
 
@@ -78,7 +78,7 @@ class CommentRequest(BaseModel):
 # Enable CORS for Vite dev server (and production domains)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "https://legipulse.org","https://www.legipulse.org""*"],
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "https://legipulse.org","https://www.legipulse.org","*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -280,9 +280,6 @@ def get_politician_by_id(politician_id: str):
         return cached_data
 
     # 2. Cache Miss -> Query DuckDB
-    if not DB_PATH.exists():
-        raise HTTPException(status_code=500, detail=f"DuckDB database file not found at: {DB_PATH}")
-
     conn = get_db_cursor()
     try:
         sql = """
@@ -450,9 +447,6 @@ def get_politician_key_bills(bioguide_id: str) -> List[Dict[str, Any]]:
         return cached_data
 
     # 2. Cache Miss -> Query DuckDB
-    if not DB_PATH.exists():
-        raise HTTPException(status_code=500, detail=f"DuckDB database file not found at: {DB_PATH}")
-
     conn = get_db_cursor()
 
     sql = """

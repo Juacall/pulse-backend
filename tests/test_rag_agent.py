@@ -10,7 +10,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 def _load_agent(monkeypatch):
     monkeypatch.setenv("VOYAGE_API_KEY", "test-voyage-key")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-anthropic-key")
-    return importlib.import_module("rag.agent")
+    module = importlib.import_module("rag.agent")
+    # Importing reloads .env; keep tests on the local temp database
+    monkeypatch.delenv("MOTHERDUCK_TOKEN", raising=False)
+    return module
 
 
 def test_execute_sql_query_truncates_large_result_sets(tmp_path, monkeypatch):

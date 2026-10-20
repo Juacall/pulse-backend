@@ -18,8 +18,12 @@ from langchain_core.tools import tool
 from langchain_voyageai import VoyageAIEmbeddings
 from typing import List, Dict, Any, Optional, Literal
 from scripts.rag.router import PreProcessingRouter
+from scripts.rag.database import (
+    LOCAL_DB_PATH as DB_PATH,
+    connect_duckdb,
+    use_motherduck,
+)
 
-DB_PATH = Path(__file__).resolve().parents[2] / "dev.duckdb"
 EMBEDDING_DIMENSIONS = 512
 MAX_SQL_RESULT_ROWS = 50
 MAX_SQL_CELL_CHARACTERS = 1_000
@@ -106,7 +110,7 @@ def vector_search_bills(query: str, state_code: Optional[str] = None, top_k: int
             f"expected {EMBEDDING_DIMENSIONS}."
         )
 
-    conn = duckdb.connect(DB_PATH, read_only=True)
+    conn = connect_duckdb(DB_PATH)
     try:
         embedding_column = next(
             (
@@ -124,8 +128,9 @@ def vector_search_bills(query: str, state_code: Optional[str] = None, top_k: int
                 "Rebuild it by running scripts/rag/indexer.py."
             )
 
-        conn.execute("LOAD vss;")
-        conn.execute("SET hnsw_enable_experimental_persistence = true")
+        if not use_motherduck():
+            conn.execute("LOAD vss;")
+            conn.execute("SET hnsw_enable_experimental_persistence = true")
 
         sql = """
               SELECT page_content, chamber, state_code, party_name, activity_type,
@@ -174,7 +179,7 @@ def execute_sql_query(sql_query: str) -> str:
     repeats activities by county/member/activity, so deduplicate bill IDs
     before counting.
     """
-    conn = duckdb.connect(DB_PATH, read_only=True)
+    conn = connect_duckdb(DB_PATH)
     try:
         cursor = conn.execute(sql_query)
         if cursor.description is None:

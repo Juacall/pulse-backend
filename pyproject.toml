@@ -5,8 +5,6 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
-    "dbt-core>=1.11.6",
-    "dbt-duckdb>=1.10.1",
     "duckdb",
     "fastapi>=0.143.0",
     "fastapi-cache2[inmemory]>=0.2.2",
@@ -25,7 +23,6 @@ dependencies = [
     "supabase>=2.33.0",
     "upstash-redis>=1.8.0",
     "uvicorn[standard]>=0.54.0",
-    "voyageai>=0.5.0",
 ]
 
 [dependency-groups]
