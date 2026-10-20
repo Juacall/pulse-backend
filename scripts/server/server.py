@@ -1,4 +1,5 @@
 # server.py
+import logging
 import os
 import duckdb
 import requests
@@ -9,13 +10,15 @@ from pydantic import BaseModel
 from typing import Any, Dict, List, Optional
 from langchain_anthropic.chat_models import AnthropicAuthenticationError
 from supabase import create_client, Client, AuthApiError, AuthError
-from upstash_redis import Redis
+
+from scripts.server.cache import cache
 
 # Import your existing agent & router modules
 from scripts.rag.agent import agent_executor, DB_PATH, DataResultPayload
 from scripts.rag.router import PreProcessingRouter, QueryAnalysis
 
 app = FastAPI(title="Pulse API", version="1.0.0")
+logger = logging.getLogger("uvicorn.error")
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SECRET_KEY") # Service role for backend DB updates
@@ -26,16 +29,6 @@ supabase: Optional[Client] = (
     if SUPABASE_URL and SUPABASE_KEY
     else None
 )
-
-# Initialize async Redis connection pool
-try:
-    redis_client = Redis(
-        url=os.getenv("UPSTASH_REDIS_REST_URL"),
-        token=os.getenv("UPSTASH_REDIS_REST_TOKEN")
-    )
-except Exception as e:
-    logger.error(f"Failed to initialize Upstash Redis: {e}")
-    redis_client = None
 
 class VoteRequest(BaseModel):
     politician_id: str
@@ -180,13 +173,10 @@ def get_politicians(state: Optional[str] = None, chamber: Optional[str] = None):
     normalized_chamber = CHAMBER_ALIASES.get((chamber or "").strip().casefold())
     cache_key = f"members:list:{(state or 'ALL').upper()}:{normalized_chamber or 'all'}"
 
-    # 1. Try Upstash Redis Cache
-    try:
-        cached_data = redis_client.get(cache_key)
-        if cached_data:
-            return json.loads(cached_data) if isinstance(cached_data, str) else cached_data
-    except Exception as e:
-        print(f"Redis cache read error: {e}")
+    # 1. Try Redis Cache
+    cached_data = cache.get(cache_key)
+    if cached_data is not None:
+        return cached_data
 
     # 2. Cache Miss -> Query DuckDB
     conn = duckdb.connect(str(DB_PATH), read_only=True)
@@ -230,10 +220,7 @@ def get_politicians(state: Optional[str] = None, chamber: Optional[str] = None):
         records = df.astype(object).where(df.notna(), None).to_dict(orient="records")
 
         # 3. Store in Upstash Redis (TTL: 24 Hours)
-        try:
-            redis_client.set(cache_key, json.dumps(records, default=str), ex=86400)
-        except Exception as e:
-            print(f"Redis cache write error: {e}")
+        cache.set(cache_key, records, ex_seconds=86400)
 
         return records
     except Exception as e:
@@ -245,13 +232,10 @@ def get_politician_by_id(politician_id: str):
     """Fetch detailed metadata for a single politician by bioguide ID."""
     cache_key = f"member:profile:{politician_id}"
 
-    # 1. Check Upstash Redis Cache
-    try:
-        cached_data = redis_client.get(cache_key)
-        if cached_data:
-            return json.loads(cached_data) if isinstance(cached_data, str) else cached_data
-    except Exception as e:
-        print(f"Redis cache read error: {e}")
+    # 1. Check Redis Cache
+    cached_data = cache.get(cache_key)
+    if cached_data is not None:
+        return cached_data
 
     # 2. Cache Miss -> Query DuckDB
     if not DB_PATH.exists():
@@ -286,10 +270,7 @@ def get_politician_by_id(politician_id: str):
         }
 
         # 3. Store in Upstash Redis (TTL: 24 Hours)
-        try:
-            redis_client.set(cache_key, json.dumps(profile), ex=86400)
-        except Exception as e:
-            print(f"Redis cache write error: {e}")
+        cache.set(cache_key, profile, ex_seconds=86400)
 
         return profile
     except HTTPException:
@@ -308,13 +289,10 @@ def get_politician_donors(politician_id: str, cycle: Optional[int] = None):
     if cycle is not None:
         cache_key += f":cycle_{cycle}"
 
-    # 1. Try Upstash Redis Cache
-    try:
-        cached_data = redis_client.get(cache_key)
-        if cached_data:
-            return json.loads(cached_data) if isinstance(cached_data, str) else cached_data
-    except Exception as e:
-        print(f"Redis cache read error: {e}")
+    # 1. Try Redis Cache
+    cached_data = cache.get(cache_key)
+    if cached_data is not None:
+        return cached_data
 
     # 2. Cache Miss -> Query DuckDB
     conn = duckdb.connect(str(DB_PATH), read_only=True)
@@ -343,11 +321,7 @@ def get_politician_donors(politician_id: str, cycle: Optional[int] = None):
 
         records = conn.execute(sql, params).fetchdf().to_dict(orient="records")
 
-        # 3. Store in Upstash Redis (TTL: 24 Hours)
-        try:
-            redis_client.set(cache_key, json.dumps(records), ex=86400)
-        except Exception as e:
-            print(f"Redis cache write error: {e}")
+        cache.set(cache_key, records, ex_seconds=86400)
 
         return records
     except HTTPException:
@@ -365,13 +339,10 @@ def get_politician_donation_summary(politician_id: str):
     """Fetch aggregate OpenFEC campaign finance totals for a politician."""
     cache_key = f"fec:summary:{politician_id}"
 
-    # 1. Try Upstash Redis Cache
-    try:
-        cached_data = redis_client.get(cache_key)
-        if cached_data:
-            return json.loads(cached_data) if isinstance(cached_data, str) else cached_data
-    except Exception as e:
-        print(f"Redis cache read error: {e}")
+    # 1. Try Redis Cache
+    cached_data = cache.get(cache_key)
+    if cached_data is not None:
+        return cached_data
 
     # 2. Cache Miss -> Query DuckDB
     conn = duckdb.connect(str(DB_PATH), read_only=True)
@@ -413,11 +384,7 @@ def get_politician_donation_summary(politician_id: str):
             "summaryStatus": "available" if summary_available else "unavailable",
         }
 
-        # 3. Store in Upstash Redis (TTL: 24 Hours)
-        try:
-            redis_client.set(cache_key, json.dumps(result), ex=86400)
-        except Exception as e:
-            print(f"Redis cache write error: {e}")
+        cache.set(cache_key, result, ex_seconds=86400)
 
         return result
     except HTTPException:
@@ -435,13 +402,10 @@ def get_politician_key_bills(bioguide_id: str) -> List[Dict[str, Any]]:
     """Fetch top sponsored and cosponsored bills dynamically from DuckDB for a member."""
     cache_key = f"bills:member:{bioguide_id}"
 
-    # 1. Try Upstash Redis Cache
-    try:
-        cached_data = redis_client.get(cache_key)
-        if cached_data:
-            return json.loads(cached_data) if isinstance(cached_data, str) else cached_data
-    except Exception as e:
-        print(f"Redis cache read error: {e}")
+    # 1. Try Redis Cache
+    cached_data = cache.get(cache_key)
+    if cached_data is not None:
+        return cached_data
 
     # 2. Cache Miss -> Query DuckDB
     if not DB_PATH.exists():
@@ -483,11 +447,7 @@ def get_politician_key_bills(bioguide_id: str) -> List[Dict[str, Any]]:
 
         records = df.to_dict(orient="records")
 
-        # 3. Store in Upstash Redis (TTL: 12 Hours)
-        try:
-            redis_client.set(cache_key, json.dumps(records), ex=43200)
-        except Exception as e:
-            print(f"Redis cache write error: {e}")
+        cache.set(cache_key, records, ex_seconds=43200)
 
         return records
     except Exception as e:
@@ -677,9 +637,65 @@ def submit_vote(
             on_conflict="user_id, politician_id"
         ).execute()
 
+        # Sentiment counts are not invalidated here; the short-TTL cache expires on its own.
         return {"status": "success", "message": "Vote recorded successfully."}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+def fetch_sentiment_from_supabase(politician_id: str) -> Dict[str, int]:
+    """Fallback query to aggregate votes directly from Supabase PostgreSQL."""
+    try:
+        # Query vote counts grouped by vote_type
+        response = (
+            supabase.table("user_votes")
+            .select("vote_type")
+            .eq("politician_id", politician_id)
+            .execute()
+        )
+
+        data = response.data or []
+
+        # Calculate tallies
+        stats = {"approve": 0, "neutral": 0, "disapprove": 0}
+        for row in data:
+            v_type = row.get("vote_type")
+            if v_type in stats:
+                stats[v_type] += 1
+
+        return stats
+    except Exception as e:
+        logger.error(f"Supabase vote aggregation error for {politician_id}: {e}")
+        raise HTTPException(
+            status_code=500, detail="Failed to calculate vote stats from database."
+        )
+
+
+@app.get("/api/politicians/{politician_id}/votes/stats")
+def get_politician_vote_stats(politician_id: str) -> Dict[str, Any]:
+    """Fetch public aggregate vote sentiment (Upstash Redis -> Supabase Fallback)."""
+    cache_key = f"sentiment:{politician_id}"
+
+    # 1. Read Path: Check Upstash Redis
+    cached_stats = cache.get(cache_key)
+    if cached_stats is not None:
+        return {
+            "politicianId": politician_id,
+            "sentimentStats": cached_stats,
+            "source": "cache"
+        }
+
+    # 2. Cache Miss / Fallback: Fetch from Supabase PostgreSQL
+    stats = fetch_sentiment_from_supabase(politician_id)
+
+    # 3. Write-Through: Cache in Upstash Redis (TTL: 30 seconds)
+    # Votes don't invalidate this key; it expires naturally and the next reader refreshes it from Supabase
+    cache.set(cache_key, stats, ex_seconds=30)
+
+    return {
+        "politicianId": politician_id,
+        "sentimentStats": stats,
+        "source": "database"
+    }
 
 if __name__ == "__main__":
     import uvicorn
