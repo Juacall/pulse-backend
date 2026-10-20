@@ -2,6 +2,7 @@ import logging
 import json
 import os
 from typing import Any, Optional
+import httpx
 from upstash_redis import Redis
 
 from scripts.rag.environment import load_project_environment
@@ -9,6 +10,7 @@ from scripts.rag.environment import load_project_environment
 load_project_environment()
 
 logger = logging.getLogger("uvicorn.error")
+REDIS_TIMEOUT_SECONDS = 2.0
 
 class SafeRedisCache:
     def __init__(self):
@@ -20,7 +22,9 @@ class SafeRedisCache:
             self.client = None
         else:
             try:
-                self.client = Redis(url=url, token=token)
+                self.client = Redis(url=url, token=token, rest_retries=0)
+                # The Upstash SDK defaults to no HTTP timeout; bound it so a slow Redis can't hang requests
+                self.client._http._client.timeout = httpx.Timeout(REDIS_TIMEOUT_SECONDS)
             except Exception as e:
                 logger.error(f"Failed to initialize Upstash Redis client: {e}")
                 self.client = None

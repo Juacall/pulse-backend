@@ -1,6 +1,7 @@
 # server.py
 import logging
 import os
+import threading
 import duckdb
 import requests
 from fastapi import FastAPI, Depends, HTTPException, Header, Request
@@ -30,6 +31,37 @@ supabase: Optional[Client] = (
     else None
 )
 
+# One shared read-only DuckDB connection per worker; each request gets its own cursor (thread-safe)
+_duckdb_conn: Optional[duckdb.DuckDBPyConnection] = None
+_duckdb_path: Optional[str] = None
+_duckdb_lock = threading.Lock()
+
+
+def get_db_cursor() -> duckdb.DuckDBPyConnection:
+    """Return a per-request cursor on the worker's shared read-only DuckDB connection."""
+    global _duckdb_conn, _duckdb_path
+    with _duckdb_lock:
+        if _duckdb_conn is None or _duckdb_path != str(DB_PATH):
+            if not DB_PATH.exists():
+                raise HTTPException(
+                    status_code=500, detail=f"DuckDB database file not found at: {DB_PATH}"
+                )
+            if _duckdb_conn is not None:
+                _duckdb_conn.close()
+            _duckdb_conn = duckdb.connect(str(DB_PATH), read_only=True)
+            _duckdb_path = str(DB_PATH)
+        return _duckdb_conn.cursor()
+
+
+@app.on_event("shutdown")
+def close_db_connection():
+    global _duckdb_conn, _duckdb_path
+    with _duckdb_lock:
+        if _duckdb_conn is not None:
+            _duckdb_conn.close()
+            _duckdb_conn = None
+            _duckdb_path = None
+
 class VoteRequest(BaseModel):
     politician_id: str
     vote_type: str  # 'approve', 'disapprove', or 'neutral'
@@ -46,7 +78,7 @@ class CommentRequest(BaseModel):
 # Enable CORS for Vite dev server (and production domains)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "*"],
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "https://legipulse.org","https://www.legipulse.org""*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -163,6 +195,16 @@ def get_current_user(authorization: str = Header(...)):
         ) from e
 
     return user_id
+
+# -------------------------------------------------------------------
+# HEALTH CHECK ENDPOINTS
+# -------------------------------------------------------------------
+
+
+@app.get("/health", status_code=200)
+def health_check():
+    """Simple status check for container orchestrators and AWS App Runner."""
+    return {"status": "healthy", "app": "LegiPulse API"}
 # -------------------------------------------------------------------
 # POLITICIANS & DELEGATION DIRECTORY ENDPOINTS
 # -------------------------------------------------------------------
@@ -179,7 +221,7 @@ def get_politicians(state: Optional[str] = None, chamber: Optional[str] = None):
         return cached_data
 
     # 2. Cache Miss -> Query DuckDB
-    conn = duckdb.connect(str(DB_PATH), read_only=True)
+    conn = get_db_cursor()
 
     where_clauses = ["1=1"]
     params = []
@@ -241,7 +283,7 @@ def get_politician_by_id(politician_id: str):
     if not DB_PATH.exists():
         raise HTTPException(status_code=500, detail=f"DuckDB database file not found at: {DB_PATH}")
 
-    conn = duckdb.connect(str(DB_PATH), read_only=True)
+    conn = get_db_cursor()
     try:
         sql = """
               SELECT bioguide_id AS id, name, party, state, chamber,
@@ -295,7 +337,7 @@ def get_politician_donors(politician_id: str, cycle: Optional[int] = None):
         return cached_data
 
     # 2. Cache Miss -> Query DuckDB
-    conn = duckdb.connect(str(DB_PATH), read_only=True)
+    conn = get_db_cursor()
     try:
         donor_table = conn.execute("""
                                    SELECT COUNT(*)
@@ -345,7 +387,7 @@ def get_politician_donation_summary(politician_id: str):
         return cached_data
 
     # 2. Cache Miss -> Query DuckDB
-    conn = duckdb.connect(str(DB_PATH), read_only=True)
+    conn = get_db_cursor()
     try:
         summary_table = conn.execute("""
                                      SELECT COUNT(*)
@@ -411,7 +453,7 @@ def get_politician_key_bills(bioguide_id: str) -> List[Dict[str, Any]]:
     if not DB_PATH.exists():
         raise HTTPException(status_code=500, detail=f"DuckDB database file not found at: {DB_PATH}")
 
-    conn = duckdb.connect(str(DB_PATH), read_only=True)
+    conn = get_db_cursor()
 
     sql = """
           SELECT DISTINCT

@@ -1,0 +1,47 @@
+# ==========================================
+# Stage 1: Build virtual environment with uv
+# ==========================================
+FROM python:3.11-slim as builder
+
+WORKDIR /app
+
+# Install uv for fast dependency resolution
+RUN pip install --no-cache-dir uv
+
+# Copy dependency specifications first to leverage Docker layer caching
+COPY pyproject.toml uv.lock ./
+
+# Install dependencies into a standalone virtual environment
+RUN uv sync --frozen --no-dev
+
+# ==========================================
+# Stage 2: Minimal Production Runner Image
+# ==========================================
+FROM python:3.11-slim as runner
+
+WORKDIR /app
+
+# Non-root user setup for security
+RUN groupadd -g 999 appgroup && \
+    useradd -r -u 999 -g appgroup appuser
+
+# Copy virtualenv from builder
+COPY --from=builder /app/.venv /app/.venv
+ENV PATH="/app/.venv/bin:$PATH"
+
+# Copy application code and database files
+COPY . .
+
+# Ensure data folder and permissions belong to non-root user
+RUN mkdir -p /app/data && chown -R appuser:appgroup /app
+
+USER appuser
+
+EXPOSE 8000
+
+# Health check endpoint verification
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/health').read()" || exit 1
+
+# Launch production server with Uvicorn
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
