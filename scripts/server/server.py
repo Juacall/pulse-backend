@@ -47,7 +47,7 @@ def get_db_cursor() -> duckdb.DuckDBPyConnection:
                 _duckdb_conn.close()
             try:
                 _duckdb_conn = connect_duckdb(DB_PATH)
-            except FileNotFoundError as e:
+            except (FileNotFoundError, RuntimeError) as e:
                 raise HTTPException(status_code=500, detail=str(e))
             _duckdb_path = database_label(DB_PATH)
         return _duckdb_conn.cursor()

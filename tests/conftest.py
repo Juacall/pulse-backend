@@ -5,6 +5,7 @@ import pytest
 def isolate_external_services(monkeypatch):
     # Tests patch DB_PATH with temp files: never use MotherDuck or the shared Redis cache
     monkeypatch.delenv("MOTHERDUCK_TOKEN", raising=False)
+    monkeypatch.setenv("ALLOW_LOCAL_DB_FALLBACK", "true")
     try:
         from scripts.server.cache import cache
     except ImportError:
