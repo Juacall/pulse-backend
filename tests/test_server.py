@@ -1,9 +1,9 @@
 from pathlib import Path
 import sys
 from types import SimpleNamespace
+from unittest.mock import MagicMock, Mock
 
 import duckdb
-from unittest.mock import Mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -207,7 +207,7 @@ def test_politician_donors_returns_donors_and_filters_by_cycle(
     db_path = tmp_path / "donors.duckdb"
     conn = duckdb.connect(str(db_path))
     conn.execute("""
-        CREATE TABLE member_top_donors (
+        CREATE TABLE member_top_donors (\
             bioguide_id VARCHAR,
             donor_name VARCHAR,
             amount DOUBLE,
@@ -363,3 +363,113 @@ def test_politician_donation_summary_reports_when_ingestion_has_not_run(
         assert error.status_code == 503
     else:
         raise AssertionError("Expected summary endpoint to report unavailable data")
+
+
+def test_get_current_user_raises_401_on_malformed_auth_header():
+    try:
+        server.get_current_user(authorization="Basic 12345")
+    except server.HTTPException as error:
+        assert error.status_code == 401
+        assert "Invalid auth header format" in error.detail
+    else:
+        raise AssertionError("Expected malformed auth header to return 401")
+
+
+def test_get_current_user_raises_401_on_missing_token():
+    try:
+        server.get_current_user(authorization="Bearer ")
+    except server.HTTPException as error:
+        assert error.status_code == 401
+        assert "Token is missing" in error.detail
+    else:
+        raise AssertionError("Expected missing token to return 401")
+
+
+def test_get_current_user_returns_clear_error_on_auth_api_error(monkeypatch):
+    mock_supabase = MagicMock()
+    jwt_error_message = (
+        "invalid JWT: unable to parse or verify signature, "
+        "token is malformed: token contains an invalid number of segments"
+    )
+    mock_supabase.auth.get_user.side_effect = server.AuthApiError(
+        message=jwt_error_message,
+        status=400,
+        code=None,
+    )
+    monkeypatch.setattr(server, "supabase", mock_supabase)
+
+    try:
+        server.get_current_user(authorization="Bearer malformed.token")
+    except server.HTTPException as error:
+        assert error.status_code == 401
+        assert "Invalid or expired session token" in error.detail
+        assert jwt_error_message in error.detail
+    else:
+        raise AssertionError("Expected AuthApiError to be converted to HTTPException 401")
+
+
+def test_get_current_user_returns_403_when_identity_not_verified(monkeypatch):
+    mock_supabase = MagicMock()
+    mock_supabase.auth.get_user.return_value = SimpleNamespace(
+        user=SimpleNamespace(id="user-123")
+    )
+    mock_profile_result = MagicMock()
+    mock_profile_result.data = {"id": "user-123", "is_identity_verified": False}
+    mock_supabase.table.return_value.select.return_value.eq.return_value.single.return_value.execute.return_value = (
+        mock_profile_result
+    )
+    monkeypatch.setattr(server, "supabase", mock_supabase)
+
+    try:
+        server.get_current_user(authorization="Bearer valid.token")
+    except server.HTTPException as error:
+        assert error.status_code == 403
+        assert "Identity verification required" in error.detail
+    else:
+        raise AssertionError("Expected unverified profile to return 403")
+
+
+def test_get_current_user_succeeds_for_verified_user(monkeypatch):
+    mock_supabase = MagicMock()
+    mock_supabase.auth.get_user.return_value = SimpleNamespace(
+        user=SimpleNamespace(id="user-123")
+    )
+    mock_profile_result = MagicMock()
+    mock_profile_result.data = {"id": "user-123", "is_identity_verified": True}
+    mock_supabase.table.return_value.select.return_value.eq.return_value.single.return_value.execute.return_value = (
+        mock_profile_result
+    )
+    monkeypatch.setattr(server, "supabase", mock_supabase)
+
+    user_id = server.get_current_user(authorization="Bearer valid.token")
+    assert user_id == "user-123"
+
+
+def test_vote_endpoint_returns_json_error_instead_of_stack_trace_on_malformed_jwt(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    mock_supabase = MagicMock()
+    jwt_error_message = (
+        "invalid JWT: unable to parse or verify signature, "
+        "token is malformed: token contains an invalid number of segments"
+    )
+    mock_supabase.auth.get_user.side_effect = server.AuthApiError(
+        message=jwt_error_message,
+        status=400,
+        code=None,
+    )
+    monkeypatch.setattr(server, "supabase", mock_supabase)
+
+    client = TestClient(server.app, raise_server_exceptions=False)
+    response = client.post(
+        "/api/vote",
+        headers={"Authorization": "Bearer malformed.token"},
+        json={
+            "politician_id": "H1",
+            "vote_type": "approve",
+            "turnstile_token": "dummy-token",
+        },
+    )
+
+    assert response.status_code == 401
+    assert jwt_error_message in response.json()["detail"]

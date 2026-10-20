@@ -20,7 +20,10 @@ dependencies = [
     "langgraph>=1.0.0",
     "pandas>=2.2.0",
     "pydantic>=2.12.5",
+    "requests>=2.32.5",
     "sentence-transformers>=6.1.0",
+    "supabase>=2.33.0",
+    "upstash-redis>=1.8.0",
     "uvicorn[standard]>=0.54.0",
     "voyageai>=0.5.0",
 ]

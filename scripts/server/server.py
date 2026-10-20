@@ -1,17 +1,54 @@
 # server.py
 import os
 import duckdb
-from fastapi import FastAPI, HTTPException
+import requests
+from fastapi import FastAPI, Depends, HTTPException, Header, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Any, Dict, List, Optional
 from langchain_anthropic.chat_models import AnthropicAuthenticationError
+from supabase import create_client, Client, AuthApiError, AuthError
+from upstash_redis import Redis
 
 # Import your existing agent & router modules
 from scripts.rag.agent import agent_executor, DB_PATH, DataResultPayload
 from scripts.rag.router import PreProcessingRouter, QueryAnalysis
 
-app = FastAPI(title="LegisPulse API", version="1.0.0")
+app = FastAPI(title="Pulse API", version="1.0.0")
+
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_SECRET_KEY") # Service role for backend DB updates
+TURNSTILE_SECRET_KEY = os.getenv("TURNSTILE_SECRET_KEY")
+
+supabase: Optional[Client] = (
+    create_client(SUPABASE_URL, SUPABASE_KEY)
+    if SUPABASE_URL and SUPABASE_KEY
+    else None
+)
+
+# Initialize async Redis connection pool
+try:
+    redis_client = Redis(
+        url=os.getenv("UPSTASH_REDIS_REST_URL"),
+        token=os.getenv("UPSTASH_REDIS_REST_TOKEN")
+    )
+except Exception as e:
+    logger.error(f"Failed to initialize Upstash Redis: {e}")
+    redis_client = None
+
+class VoteRequest(BaseModel):
+    politician_id: str
+    vote_type: str  # 'approve', 'disapprove', or 'neutral'
+    turnstile_token: str
+
+class ChatRequest(BaseModel):
+    query: str
+
+class CommentRequest(BaseModel):
+    politician_id: str
+    text: str
+    vote_type: str
 
 # Enable CORS for Vite dev server (and production domains)
 app.add_middleware(
@@ -21,6 +58,25 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(AuthApiError)
+async def auth_api_error_handler(request: Request, exc: AuthApiError):
+    error_msg = getattr(exc, "message", None) or str(exc)
+    return JSONResponse(
+        status_code=401,
+        content={"detail": f"Invalid or expired session token: {error_msg}"},
+    )
+
+
+@app.exception_handler(AuthError)
+async def auth_error_handler(request: Request, exc: AuthError):
+    error_msg = getattr(exc, "message", None) or str(exc)
+    return JSONResponse(
+        status_code=401,
+        content={"detail": f"Authentication error: {error_msg}"},
+    )
+
 
 router = PreProcessingRouter()
 
@@ -32,25 +88,107 @@ CHAMBER_ALIASES = {
     "senate": "senate",
 }
 
-class ChatRequest(BaseModel):
-    query: str
 
-class VoteRequest(BaseModel):
-    politician_id: str
-    vote_type: str  # 'approve', 'disapprove', or 'neutral'
 
-class CommentRequest(BaseModel):
-    politician_id: str
-    text: str
-    vote_type: str
+def verify_turnstile_token(token: str):
+    """Validates token with Cloudflare Turnstile API."""
+    if not TURNSTILE_SECRET_KEY:
+        raise HTTPException(status_code=503, detail="Bot protection service is not configured.")
 
+    try:
+        res = requests.post(
+            "https://challenges.cloudflare.com/turnstile/v0/siteverify",
+            data={
+                "secret": TURNSTILE_SECRET_KEY,
+                "response": token
+            },
+            timeout=10,
+        )
+        outcome = res.json()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Bot protection check error: {str(e)}")
+
+    if not outcome.get("success"):
+        error_codes = outcome.get("error-codes")
+        msg = f"Bot protection check failed: {', '.join(error_codes)}" if error_codes else "Bot protection check failed."
+        raise HTTPException(status_code=400, detail=msg)
+
+def get_current_user(authorization: str = Header(...)):
+    """Verifies Supabase JWT and checks ID verification flag."""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid auth header format. Expected 'Bearer <token>'."
+        )
+
+    parts = authorization.split(" ", 1)
+    if len(parts) < 2 or not parts[1].strip():
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid auth header format. Token is missing."
+        )
+
+    token = parts[1].strip()
+
+    if not supabase:
+        raise HTTPException(
+            status_code=503,
+            detail="Authentication service is not configured."
+        )
+
+    # 1. Verify token with Supabase Auth
+    try:
+        user_res = supabase.auth.get_user(token)
+    except (AuthApiError, AuthError) as e:
+        error_msg = getattr(e, "message", None) or str(e)
+        raise HTTPException(
+            status_code=401,
+            detail=f"Invalid or expired session token: {error_msg}"
+        ) from e
+    except Exception as e:
+        raise HTTPException(
+            status_code=401,
+            detail=f"Authentication error: {str(e)}"
+        ) from e
+
+    if not user_res or not user_res.user:
+        raise HTTPException(status_code=401, detail="Invalid or expired session token.")
+
+    user_id = user_res.user.id
+
+    # 2. Check profile verification state in PostgreSQL
+    try:
+        profile = supabase.table("profiles").select("*").eq("id", user_id).single().execute()
+        if not profile.data or not profile.data.get("is_identity_verified"):
+            raise HTTPException(status_code=403, detail="Identity verification required to vote.")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Identity verification check failed: {str(e)}"
+        ) from e
+
+    return user_id
 # -------------------------------------------------------------------
-# 1. POLITICIANS & DELEGATION DIRECTORY ENDPOINTS
+# POLITICIANS & DELEGATION DIRECTORY ENDPOINTS
 # -------------------------------------------------------------------
 
 @app.get("/api/politicians")
 def get_politicians(state: Optional[str] = None, chamber: Optional[str] = None):
     """Fetch the member directory with pre-aggregated legislative metrics."""
+    normalized_chamber = CHAMBER_ALIASES.get((chamber or "").strip().casefold())
+    cache_key = f"members:list:{(state or 'ALL').upper()}:{normalized_chamber or 'all'}"
+
+    # 1. Try Upstash Redis Cache
+    try:
+        cached_data = redis_client.get(cache_key)
+        if cached_data:
+            return json.loads(cached_data) if isinstance(cached_data, str) else cached_data
+    except Exception as e:
+        print(f"Redis cache read error: {e}")
+
+    # 2. Cache Miss -> Query DuckDB
     conn = duckdb.connect(str(DB_PATH), read_only=True)
 
     where_clauses = ["1=1"]
@@ -60,7 +198,6 @@ def get_politicians(state: Optional[str] = None, chamber: Optional[str] = None):
         where_clauses.append("members.state_code = ?")
         params.append(state.upper())
 
-    normalized_chamber = CHAMBER_ALIASES.get((chamber or "").strip().casefold())
     if normalized_chamber:
         where_clauses.append("LOWER(TRIM(members.chamber)) = ?")
         params.append(normalized_chamber)
@@ -90,22 +227,103 @@ def get_politicians(state: Optional[str] = None, chamber: Optional[str] = None):
     try:
         df = conn.execute(sql, params).fetchdf()
         conn.close()
-        return df.astype(object).where(df.notna(), None).to_dict(orient="records")
+        records = df.astype(object).where(df.notna(), None).to_dict(orient="records")
+
+        # 3. Store in Upstash Redis (TTL: 24 Hours)
+        try:
+            redis_client.set(cache_key, json.dumps(records, default=str), ex=86400)
+        except Exception as e:
+            print(f"Redis cache write error: {e}")
+
+        return records
     except Exception as e:
         conn.close()
         raise HTTPException(status_code=500, detail=f"Database Query Error: {str(e)}")
 
+@app.get("/api/politicians/{politician_id}")
+def get_politician_by_id(politician_id: str):
+    """Fetch detailed metadata for a single politician by bioguide ID."""
+    cache_key = f"member:profile:{politician_id}"
+
+    # 1. Check Upstash Redis Cache
+    try:
+        cached_data = redis_client.get(cache_key)
+        if cached_data:
+            return json.loads(cached_data) if isinstance(cached_data, str) else cached_data
+    except Exception as e:
+        print(f"Redis cache read error: {e}")
+
+    # 2. Cache Miss -> Query DuckDB
+    if not DB_PATH.exists():
+        raise HTTPException(status_code=500, detail=f"DuckDB database file not found at: {DB_PATH}")
+
+    conn = duckdb.connect(str(DB_PATH), read_only=True)
+    try:
+        sql = """
+              SELECT bioguide_id AS id, name, party, state, chamber,
+                     district, office_address, phone, website_url
+              FROM main.members
+              WHERE bioguide_id = ? \
+              """
+        row = conn.execute(sql, [politician_id]).fetchone()
+
+        if row is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Politician with ID {politician_id} not found."
+            )
+
+        profile = {
+            "id": row[0],
+            "name": row[1],
+            "party": row[2],
+            "state": row[3],
+            "chamber": row[4],
+            "district": row[5],
+            "officeAddress": row[6],
+            "phone": row[7],
+            "websiteUrl": row[8]
+        }
+
+        # 3. Store in Upstash Redis (TTL: 24 Hours)
+        try:
+            redis_client.set(cache_key, json.dumps(profile), ex=86400)
+        except Exception as e:
+            print(f"Redis cache write error: {e}")
+
+        return profile
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"DuckDB Member Query Error: {str(e)}"
+        )
+    finally:
+        conn.close()
 
 @app.get("/api/politicians/{politician_id}/donors")
 def get_politician_donors(politician_id: str, cycle: Optional[int] = None):
     """Fetch cached OpenFEC top contributors for a politician."""
+    cache_key = f"fec:donors:{politician_id}"
+    if cycle is not None:
+        cache_key += f":cycle_{cycle}"
+
+    # 1. Try Upstash Redis Cache
+    try:
+        cached_data = redis_client.get(cache_key)
+        if cached_data:
+            return json.loads(cached_data) if isinstance(cached_data, str) else cached_data
+    except Exception as e:
+        print(f"Redis cache read error: {e}")
+
+    # 2. Cache Miss -> Query DuckDB
     conn = duckdb.connect(str(DB_PATH), read_only=True)
     try:
         donor_table = conn.execute("""
-            SELECT COUNT(*)
-            FROM information_schema.tables
-            WHERE table_schema = 'main' AND table_name = 'member_top_donors'
-        """).fetchone()[0]
+                                   SELECT COUNT(*)
+                                   FROM information_schema.tables
+                                   WHERE table_schema = 'main' AND table_name = 'member_top_donors'
+                                   """).fetchone()[0]
         if not donor_table:
             raise HTTPException(
                 status_code=503,
@@ -113,16 +331,25 @@ def get_politician_donors(politician_id: str, cycle: Optional[int] = None):
             )
 
         sql = """
-            SELECT donor_name AS donorName, amount, industry, cycle
-            FROM main.member_top_donors
-            WHERE bioguide_id = ?
-        """
+              SELECT donor_name AS donorName, amount, industry, cycle
+              FROM main.member_top_donors
+              WHERE bioguide_id = ? \
+              """
         params = [politician_id]
         if cycle is not None:
             sql += " AND cycle = ?"
             params.append(str(cycle))
         sql += " ORDER BY amount DESC, donor_name ASC"
-        return conn.execute(sql, params).fetchdf().to_dict(orient="records")
+
+        records = conn.execute(sql, params).fetchdf().to_dict(orient="records")
+
+        # 3. Store in Upstash Redis (TTL: 24 Hours)
+        try:
+            redis_client.set(cache_key, json.dumps(records), ex=86400)
+        except Exception as e:
+            print(f"Redis cache write error: {e}")
+
+        return records
     except HTTPException:
         raise
     except Exception as e:
@@ -136,13 +363,24 @@ def get_politician_donors(politician_id: str, cycle: Optional[int] = None):
 @app.get("/api/politicians/{politician_id}/donations/summary")
 def get_politician_donation_summary(politician_id: str):
     """Fetch aggregate OpenFEC campaign finance totals for a politician."""
+    cache_key = f"fec:summary:{politician_id}"
+
+    # 1. Try Upstash Redis Cache
+    try:
+        cached_data = redis_client.get(cache_key)
+        if cached_data:
+            return json.loads(cached_data) if isinstance(cached_data, str) else cached_data
+    except Exception as e:
+        print(f"Redis cache read error: {e}")
+
+    # 2. Cache Miss -> Query DuckDB
     conn = duckdb.connect(str(DB_PATH), read_only=True)
     try:
         summary_table = conn.execute("""
-            SELECT COUNT(*)
-            FROM information_schema.tables
-            WHERE table_schema = 'main' AND table_name = 'member_fec_summary'
-        """).fetchone()[0]
+                                     SELECT COUNT(*)
+                                     FROM information_schema.tables
+                                     WHERE table_schema = 'main' AND table_name = 'member_fec_summary'
+                                     """).fetchone()[0]
         if not summary_table:
             raise HTTPException(
                 status_code=503,
@@ -165,7 +403,7 @@ def get_politician_donation_summary(politician_id: str):
             )
 
         summary_available = any(value is not None for value in row[1:4])
-        return {
+        result = {
             "fecCandidateId": row[0],
             "totalReceipts": row[1],
             "pacContributions": row[2],
@@ -174,6 +412,14 @@ def get_politician_donation_summary(politician_id: str):
             "summaryAvailable": summary_available,
             "summaryStatus": "available" if summary_available else "unavailable",
         }
+
+        # 3. Store in Upstash Redis (TTL: 24 Hours)
+        try:
+            redis_client.set(cache_key, json.dumps(result), ex=86400)
+        except Exception as e:
+            print(f"Redis cache write error: {e}")
+
+        return result
     except HTTPException:
         raise
     except Exception as e:
@@ -183,9 +429,21 @@ def get_politician_donation_summary(politician_id: str):
     finally:
         conn.close()
 
+
 @app.get("/api/politicians/{bioguide_id}/bills")
 def get_politician_key_bills(bioguide_id: str) -> List[Dict[str, Any]]:
     """Fetch top sponsored and cosponsored bills dynamically from DuckDB for a member."""
+    cache_key = f"bills:member:{bioguide_id}"
+
+    # 1. Try Upstash Redis Cache
+    try:
+        cached_data = redis_client.get(cache_key)
+        if cached_data:
+            return json.loads(cached_data) if isinstance(cached_data, str) else cached_data
+    except Exception as e:
+        print(f"Redis cache read error: {e}")
+
+    # 2. Cache Miss -> Query DuckDB
     if not DB_PATH.exists():
         raise HTTPException(status_code=500, detail=f"DuckDB database file not found at: {DB_PATH}")
 
@@ -206,7 +464,7 @@ def get_politician_key_bills(bioguide_id: str) -> List[Dict[str, Any]]:
           ORDER BY
               CASE WHEN relationship = 'sponsor' THEN 1 ELSE 2 END,
               bill_latest_action_date DESC
-              LIMIT 10; \
+              LIMIT 10;
           """
 
     try:
@@ -223,12 +481,20 @@ def get_politician_key_bills(bioguide_id: str) -> List[Dict[str, Any]]:
             "actionDate": ""
         })
 
-        return df.to_dict(orient="records")
+        records = df.to_dict(orient="records")
+
+        # 3. Store in Upstash Redis (TTL: 12 Hours)
+        try:
+            redis_client.set(cache_key, json.dumps(records), ex=43200)
+        except Exception as e:
+            print(f"Redis cache write error: {e}")
+
+        return records
     except Exception as e:
         conn.close()
         raise HTTPException(status_code=500, detail=f"DuckDB Query Error: {str(e)}")
 # -------------------------------------------------------------------
-# 2. RAG AGENT EXECUTION ENDPOINT
+# RAG AGENT EXECUTION ENDPOINT
 # -------------------------------------------------------------------
 
 @app.post("/api/chat")
@@ -382,6 +648,38 @@ def sanitize_payload(payload: DataResultPayload, response: Optional[Dict[str, An
                         break
 
     return payload
+
+# -------------------------------------------------------------------
+# Vote Endpoint
+# -------------------------------------------------------------------
+@app.post("/api/vote")
+def submit_vote(
+        request: VoteRequest,
+        user_id: str = Depends(get_current_user)
+):
+    # Step 1: Validate Cloudflare Turnstile token
+    verify_turnstile_token(request.turnstile_token)
+
+    if not supabase:
+        raise HTTPException(status_code=503, detail="Database service is not configured.")
+
+    # Step 2: Execute UPSERT in Supabase PostgreSQL
+    try:
+        vote_data = {
+            "user_id": user_id,
+            "politician_id": request.politician_id,
+            "vote_type": request.vote_type
+        }
+
+        # Upsert automatically updates the vote if (user_id, politician_id) already exists
+        supabase.table("user_votes").upsert(
+            vote_data,
+            on_conflict="user_id, politician_id"
+        ).execute()
+
+        return {"status": "success", "message": "Vote recorded successfully."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
