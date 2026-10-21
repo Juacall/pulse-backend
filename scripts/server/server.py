@@ -7,7 +7,7 @@ import threading
 import time
 import duckdb
 import requests
-from fastapi import FastAPI, Depends, HTTPException, Header, Request
+from fastapi import FastAPI, Depends, HTTPException, Header, Request, status
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -53,7 +53,7 @@ def get_db_cursor() -> duckdb.DuckDBPyConnection:
             try:
                 _duckdb_conn = connect_duckdb(DB_PATH)
             except (FileNotFoundError, RuntimeError) as e:
-                raise HTTPException(status_code=500, detail=str(e))
+                raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
             _duckdb_path = database_label(DB_PATH)
         return _duckdb_conn.cursor()
 
@@ -75,10 +75,21 @@ class VoteRequest(BaseModel):
 class ChatRequest(BaseModel):
     query: str
 
-class CommentRequest(BaseModel):
-    politician_id: str
-    text: str
-    vote_type: str
+
+class RegisterRequest(BaseModel):
+    email: str
+    password: str
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+class LoginResponse(BaseModel):
+    access_token: str
+    refresh_token: str
+    token_type: str = "bearer"
+    user_id: str
+    email: str
 
 # Enable CORS for Vite dev server (and production domains)
 app.add_middleware(
@@ -94,7 +105,7 @@ app.add_middleware(
 async def auth_api_error_handler(request: Request, exc: AuthApiError):
     error_msg = getattr(exc, "message", None) or str(exc)
     return JSONResponse(
-        status_code=401,
+        status_code=status.HTTP_401_UNAUTHORIZED,
         content={"detail": f"Invalid or expired session token: {error_msg}"},
     )
 
@@ -103,7 +114,7 @@ async def auth_api_error_handler(request: Request, exc: AuthApiError):
 async def auth_error_handler(request: Request, exc: AuthError):
     error_msg = getattr(exc, "message", None) or str(exc)
     return JSONResponse(
-        status_code=401,
+        status_code=status.HTTP_401_UNAUTHORIZED,
         content={"detail": f"Authentication error: {error_msg}"},
     )
 
@@ -116,7 +127,7 @@ ROUTER_CACHE_TTL_SECONDS = 7 * 86400
 
 def normalize_query(query: str) -> str:
     """Collapses case, whitespace and trailing punctuation so equivalent questions share a cache entry."""
-    return re.sub(r"\s+", " ", query.strip().casefold()).rstrip(" ?!.")
+    return re.sub(r"\s+", " ", query.strip().casefold()).rstrip(" ?!..")
 
 
 def analyze_query(query: str) -> QueryAnalysis:
@@ -202,7 +213,7 @@ CHAMBER_ALIASES = {
 def verify_turnstile_token(token: str):
     """Validates token with Cloudflare Turnstile API."""
     if not TURNSTILE_SECRET_KEY:
-        raise HTTPException(status_code=503, detail="Bot protection service is not configured.")
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Bot protection service is not configured.")
 
     try:
         res = requests.post(
@@ -215,25 +226,25 @@ def verify_turnstile_token(token: str):
         )
         outcome = res.json()
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Bot protection check error: {str(e)}")
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Bot protection check error: {str(e)}")
 
     if not outcome.get("success"):
         error_codes = outcome.get("error-codes")
         msg = f"Bot protection check failed: {', '.join(error_codes)}" if error_codes else "Bot protection check failed."
-        raise HTTPException(status_code=400, detail=msg)
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=msg)
 
 def get_current_user(authorization: str = Header(...)):
     """Verifies Supabase JWT and checks ID verification flag."""
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(
-            status_code=401,
+            status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid auth header format. Expected 'Bearer <token>'."
         )
 
     parts = authorization.split(" ", 1)
     if len(parts) < 2 or not parts[1].strip():
         raise HTTPException(
-            status_code=401,
+            status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid auth header format. Token is missing."
         )
 
@@ -241,7 +252,7 @@ def get_current_user(authorization: str = Header(...)):
 
     if not supabase:
         raise HTTPException(
-            status_code=503,
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Authentication service is not configured."
         )
 
@@ -251,17 +262,17 @@ def get_current_user(authorization: str = Header(...)):
     except (AuthApiError, AuthError) as e:
         error_msg = getattr(e, "message", None) or str(e)
         raise HTTPException(
-            status_code=401,
+            status_code=status.HTTP_401_UNAUTHORIZED,
             detail=f"Invalid or expired session token: {error_msg}"
         ) from e
     except Exception as e:
         raise HTTPException(
-            status_code=401,
+            status_code=status.HTTP_401_UNAUTHORIZED,
             detail=f"Authentication error: {str(e)}"
         ) from e
 
     if not user_res or not user_res.user:
-        raise HTTPException(status_code=401, detail="Invalid or expired session token.")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired session token.")
 
     user_id = user_res.user.id
 
@@ -269,12 +280,12 @@ def get_current_user(authorization: str = Header(...)):
     try:
         profile = supabase.table("profiles").select("*").eq("id", user_id).single().execute()
         if not profile.data or not profile.data.get("is_identity_verified"):
-            raise HTTPException(status_code=403, detail="Identity verification required to vote.")
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Identity verification required to vote.")
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(
-            status_code=403,
+            status_code=status.HTTP_403_FORBIDDEN,
             detail=f"Identity verification check failed: {str(e)}"
         ) from e
 
@@ -285,10 +296,63 @@ def get_current_user(authorization: str = Header(...)):
 # -------------------------------------------------------------------
 
 
-@app.get("/health", status_code=200)
+@app.get("/health", status_code=status.HTTP_200_OK)
 def health_check():
     """Simple status check for container orchestrators and AWS App Runner."""
     return {"status": "healthy", "app": "LegiPulse API"}
+
+
+# -------------------------------------------------------------------
+# AUTH ENDPOINTS
+# -------------------------------------------------------------------
+@app.post("/api/auth/register", status_code=status.HTTP_201_CREATED)
+def register_user(payload: RegisterRequest):
+    try:
+        # Registers user with Supabase Auth
+        res = supabase.auth.sign_up({
+            "email": payload.email,
+            "password": payload.password
+        })
+
+        if not res.user:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Registration failed.")
+
+        return {
+            "message": "User registered successfully",
+            "userId": res.user.id,
+            "email": res.user.email
+        }
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+@app.post("/api/auth/login", response_model=LoginResponse)
+def login(payload: LoginRequest):
+    try:
+        # Authenticate credentials against Supabase Auth
+        res = supabase.auth.sign_in_with_password({
+            "email": payload.email,
+            "password": payload.password
+        })
+
+        if not res.session or not res.user:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid email or password"
+            )
+
+        return LoginResponse(
+            access_token=res.session.access_token,
+            refresh_token=res.session.refresh_token,
+            user_id=res.user.id,
+            email=res.user.email
+        )
+
+    except Exception as e:
+        # Pass through specific authentication errors from Supabase
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid login credentials"
+        )
 # -------------------------------------------------------------------
 # POLITICIANS & DELEGATION DIRECTORY ENDPOINTS
 # -------------------------------------------------------------------
@@ -368,7 +432,7 @@ def get_politicians(state: Optional[str] = None, chamber: Optional[str] = None):
         return records
     except Exception as e:
         conn.close()
-        raise HTTPException(status_code=500, detail=f"Database Query Error: {str(e)}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Database Query Error: {str(e)}")
 
 @app.get("/api/politicians/{politician_id}")
 def get_politician_by_id(politician_id: str):
@@ -393,7 +457,7 @@ def get_politician_by_id(politician_id: str):
 
         if row is None:
             raise HTTPException(
-                status_code=404,
+                status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Politician with ID {politician_id} not found."
             )
 
@@ -417,7 +481,7 @@ def get_politician_by_id(politician_id: str):
         raise
     except Exception as e:
         raise HTTPException(
-            status_code=500, detail=f"DuckDB Member Query Error: {str(e)}"
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"DuckDB Member Query Error: {str(e)}"
         )
     finally:
         conn.close()
@@ -444,7 +508,7 @@ def get_politician_donors(politician_id: str, cycle: Optional[int] = None):
                                    """).fetchone()[0]
         if not donor_table:
             raise HTTPException(
-                status_code=503,
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="Donor data is not available; run the OpenFEC donor ingestion first.",
             )
 
@@ -468,7 +532,7 @@ def get_politician_donors(politician_id: str, cycle: Optional[int] = None):
         raise
     except Exception as e:
         raise HTTPException(
-            status_code=500, detail=f"Donor Query Error: {str(e)}"
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Donor Query Error: {str(e)}"
         )
     finally:
         conn.close()
@@ -494,7 +558,7 @@ def get_politician_donation_summary(politician_id: str):
                                      """).fetchone()[0]
         if not summary_table:
             raise HTTPException(
-                status_code=503,
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="Donation summary data is not available; run the OpenFEC summary ingestion first.",
             )
 
@@ -509,7 +573,7 @@ def get_politician_donation_summary(politician_id: str):
         ).fetchone()
         if row is None:
             raise HTTPException(
-                status_code=404,
+                status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"No donation summary found for politician {politician_id}.",
             )
 
@@ -531,7 +595,7 @@ def get_politician_donation_summary(politician_id: str):
         raise
     except Exception as e:
         raise HTTPException(
-            status_code=500, detail=f"Donation Summary Query Error: {str(e)}"
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Donation Summary Query Error: {str(e)}"
         )
     finally:
         conn.close()
@@ -589,7 +653,7 @@ def get_politician_key_bills(bioguide_id: str) -> List[Dict[str, Any]]:
         return records
     except Exception as e:
         conn.close()
-        raise HTTPException(status_code=500, detail=f"DuckDB Query Error: {str(e)}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"DuckDB Query Error: {str(e)}")
 # -------------------------------------------------------------------
 # RAG AGENT EXECUTION ENDPOINT
 # -------------------------------------------------------------------
@@ -598,7 +662,7 @@ def get_politician_key_bills(bioguide_id: str) -> List[Dict[str, Any]]:
 def chat_with_agent(request: ChatRequest):
     """Runs input through PreProcessingRouter before invoking the LangChain agent."""
     if not request.query.strip():
-        raise HTTPException(status_code=400, detail="Query string cannot be empty.")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Query string cannot be empty.")
 
     # Step 1: Pre-process query with Haiku Router
     try:
@@ -645,7 +709,7 @@ def chat_with_agent(request: ChatRequest):
             cache.set(answer_key, final_answer, ex_seconds=ANSWER_CACHE_TTL_SECONDS)
     except AnthropicAuthenticationError as error:
         raise HTTPException(
-            status_code=503,
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=(
                 "Anthropic rejected the configured API key. Update "
                 "ANTHROPIC_API_KEY in the project .env file and restart the server."
@@ -680,7 +744,7 @@ def get_official_roll_call_votes(politician_id: str):
     try:
         row = conn.execute(query, [politician_id]).fetchone()
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"DuckDB Query Error: {str(e)}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"DuckDB Query Error: {str(e)}")
     finally:
         conn.close()
 
@@ -715,7 +779,7 @@ def submit_vote(
     verify_turnstile_token(request.turnstile_token)
 
     if not supabase:
-        raise HTTPException(status_code=503, detail="Database service is not configured.")
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Database service is not configured.")
 
     # Step 2: Execute UPSERT in Supabase PostgreSQL
     try:
@@ -734,7 +798,7 @@ def submit_vote(
         # Sentiment counts are not invalidated here; the short-TTL cache expires on its own.
         return {"status": "success", "message": "Vote recorded successfully."}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Database error: {str(e)}")
 
 def fetch_sentiment_from_supabase(politician_id: str) -> Dict[str, int]:
     """Fallback query to aggregate votes directly from Supabase PostgreSQL."""
@@ -760,7 +824,7 @@ def fetch_sentiment_from_supabase(politician_id: str) -> Dict[str, int]:
     except Exception as e:
         logger.error(f"Supabase vote aggregation error for {politician_id}: {e}")
         raise HTTPException(
-            status_code=500, detail="Failed to calculate vote stats from database."
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to calculate vote stats from database."
         )
 
 
