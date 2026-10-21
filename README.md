@@ -16,11 +16,12 @@ Copy `.env.example` to `.env` and fill it in. Set `MOTHERDUCK_TOKEN` to read fro
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/health` | Liveness check. Returns `{"status": "healthy"}`. |
-| GET | `/api/politicians` | Lists members with sponsored, cosponsored and enacted bill counts and `passRate` (null when a member has no sponsored bills). Optional `state` (postal code) and `chamber` filters. Cached 24h. |
+| GET | `/api/politicians` | Lists members with sponsored, cosponsored and enacted bill counts and `passRate` (null when a member has no sponsored bills) and `rollCallVotes` (attendance summary, null when no roll-call records exist). Optional `state` (postal code) and `chamber` filters. Cached 24h. |
 | GET | `/api/politicians/{politician_id}` | Profile for one member by bioguide ID: name, party, state, chamber, district, office address, phone and website. Cached 24h. |
 | GET | `/api/politicians/{politician_id}/donors` | Top donor employer aggregates for a member. Optional `cycle` filters by election cycle. Reports when donor data hasn't been ingested. Cached 24h. |
 | GET | `/api/politicians/{politician_id}/donations/summary` | Campaign finance totals (receipts, PAC and individual contributions). `summaryStatus` is `unavailable` when all totals are null, rather than implying zero. Returns 404 if the member has no summary. Cached 24h. |
 | GET | `/api/politicians/{bioguide_id}/bills` | Key bills a member sponsored or cosponsored, including `introducedDate`. Cached 12h. |
+| GET | `/api/politicians/{politician_id}/roll-call-votes` | Official floor attendance from Voteview roll calls: `totalVotes`, `votesCast`, `missedVotes`, `presentVotes` and `attendancePercentage` (null when the member has no records). Cached 24h. |
 | GET | `/api/politicians/{politician_id}/votes/stats` | Public approve / neutral / disapprove tallies for a member. Read from Redis, falling back to Supabase (cached 30s). `source` shows which was used. |
 | POST | `/api/vote` | Records or updates the signed-in user's vote on a member. Body: `politician_id`, `vote_type` (`approve`, `disapprove` or `neutral`) and `turnstile_token`. Requires a Supabase JWT in the `Authorization` header and a valid Cloudflare Turnstile token. |
 | POST | `/api/chat` | Answers a natural-language question. Body: `{"query": "..."}`. A router classifies the query and detects a state, then the agent runs SQL and vector search and returns `synthesizedAnswer` (a structured result: text, table, list or metric) plus `routerAnalysis`. |
