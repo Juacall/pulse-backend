@@ -29,33 +29,7 @@ MAX_SQL_RESULT_ROWS = 50
 MAX_SQL_CELL_CHARACTERS = 1_000
 MAX_SQL_OUTPUT_CHARACTERS = 12_000
 
-
-class DataResultPayload(BaseModel):
-    display_type: Literal["metric", "table", "list", "text"] = Field(
-        description=(
-            "Type of UI element to render:\n"
-            "- 'metric': Single key performance indicators or counts.\n"
-            "- 'table': Multi-column tabular data.\n"
-            "- 'list': Key-value or bullet-point summaries.\n"
-            "- 'text': Pure narrative answers."
-        )
-    )
-    title: Optional[str] = Field(default=None, description="Header text for the UI card.")
-    summary: Optional[str] = Field(default=None, description="Detailed text explanation or takeaway.")
-    columns: Optional[List[str]] = Field(
-        default=None,
-        description="List of column headers for 'table' display type (e.g. ['Bill ID', 'Title', 'Status'])."
-    )
-    rows: Optional[List[Dict[str, Any]]] = Field(
-        default=None,
-        description=(
-            "Data rows matching the display type:\n"
-            "• CRITICAL FOR 'metric': Must be a list with a dict formatted exactly like:\n"
-            "  [{'label': 'Total Sponsored Bills', 'value': '323', 'subtext': 'WA Delegation'}]\n"
-            "• FOR 'table': List of dicts keyed by column names e.g. [{'Bill ID': 'HR-123', ...}]\n"
-            "• FOR 'list': List of dicts e.g. [{'title': 'Key Focus', 'description': '...'}]"
-        )
-    )
+from scripts.rag.schema import DataResultPayload
 
 
 def _format_query_result(columns, rows, *, rows_truncated=False) -> str:
@@ -162,8 +136,14 @@ def vector_search_bills(query: str, state_code: Optional[str] = None, top_k: int
     return "\n\n---\n\n".join(formatted)
 
 
-@tool
-def execute_sql_query(sql_query: str) -> str:
+def _json_safe(value):
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
+@tool(response_format="content_and_artifact")
+def execute_sql_query(sql_query: str):
     """Execute a structured SQL query against DuckDB.
     Table: mart_legislative_activity
     Columns & Conventions:
@@ -183,17 +163,21 @@ def execute_sql_query(sql_query: str) -> str:
     try:
         cursor = conn.execute(sql_query)
         if cursor.description is None:
-            return "SQL Error: query did not return a result set."
+            return "SQL Error: query did not return a result set.", None
         columns = [column[0] for column in cursor.description]
         rows = cursor.fetchmany(MAX_SQL_RESULT_ROWS + 1)
         rows_truncated = len(rows) > MAX_SQL_RESULT_ROWS
-        return _format_query_result(
-            columns,
-            rows[:MAX_SQL_RESULT_ROWS],
-            rows_truncated=rows_truncated,
-        )
+        rows = rows[:MAX_SQL_RESULT_ROWS]
+        content = _format_query_result(columns, rows, rows_truncated=rows_truncated)
+        # The artifact carries the real rows so the server never relies on the model to copy them
+        artifact = {
+            "columns": columns,
+            "rows": [[_json_safe(v) for v in row] for row in rows],
+            "truncated": rows_truncated,
+        }
+        return content, artifact
     except Exception as e:
-        return f"SQL Error: {str(e)}"
+        return f"SQL Error: {str(e)}", None
     finally:
         conn.close()
 
@@ -223,23 +207,21 @@ agent_executor = create_agent(
         "- Use `target_member_state = 'WASHINGTON'` if filtering on full uppercase state names.\n"
         "- NEVER filter `target_member_state = 'WA'` (this column holds full names, so it will return 0 rows).\n\n"
         "RESPONSE FORMATTING CONTRACT (DataResultPayload):\n"
+        "The server fills in table rows from your SQL results, so never retype or invent them.\n"
         "1. METRIC RESPONSES (display_type='metric'):\n"
-        "   - NEVER output empty dicts [{}] in rows.\n"
-        "   - MUST include rows: [{'label': '<Title/Metric Name>', 'value': '<Number>', 'subtext': '<Context>'}]\n\n"
-        "2. TABLE RESPONSES (display_type='table'):\n"
-        "   - NEVER output empty dicts [{}] in rows.\n"
-        "   - Every dict in `rows` MUST contain key-value pairs corresponding to your `columns`.\n"
-        "   - Limit `rows` to 5-10 representative items to avoid output truncation or empty objects.\n\n"
-        "3. QUALITATIVE RESPONSES (display_type='text' or 'list'):\n"
-        "   - Use 'text' or 'list' when no tabular rows exist."
-        "2. BILL LISTINGS / TABULAR SEARCHES:\n"
-        "   - Set display_type = 'table'.\n"
-        "   - NEVER put raw bill lists or bulleted status breakdowns solely inside 'summary'.\n"
-        "   - Populate 'columns' with key fields (e.g. ['Bill ID', 'Title', 'Status', 'Latest Action Date', 'Theme']).\n"
-        "   - Populate 'rows' with representative bill dicts (e.g. S-160, HR-3922, S-1462, HR-345).\n"
-        "   - Put dataset scope notes (e.g. 'Federal HR/S bills only, no state AB/SB') and overall thematic takeaways in 'summary'.\n\n"
-        "3. QUALITATIVE OVERVIEWS:\n"
-        "   - Set display_type = 'list' or 'text' ONLY when no structured numbers or tabular rows exist."
+        "   - rows: [{'label': '<Metric Name>', 'value': '<Number>', 'subtext': '<Context>'}]. Never output empty dicts.\n\n"
+        "2. TABLE RESPONSES / BILL LISTINGS (display_type='table'):\n"
+        "   - Use for bills, statuses and any multi-row listing; leave `rows` empty.\n"
+        "   - Set `columns` to readable headers in the same order as the SQL result columns "
+        "(e.g. ['Bill ID', 'Title', 'Status', 'Latest Action Date']).\n"
+        "   - Put dataset scope notes (e.g. 'Federal HR/S bills only, no state AB/SB') and thematic takeaways in 'summary'.\n\n"
+        "3. LIST RESPONSES (display_type='list'):\n"
+        "   - Use for topic/theme breakdowns. Fill `list_items` (leave `rows` empty): one item per topic, 4-8 items, "
+        "e.g. title='Health care', description='~12% of bills, e.g. HR-123'.\n"
+        "   - `summary` is 1-3 sentences: the headline number or takeaway only. Put detail and caveats "
+        "(methodology, scope) in the rows, never in a long summary paragraph.\n"
+        "   - Use 'text' only for a short narrative when no breakdown exists.\n\n"
+        "Do not run placeholder queries such as SELECT 1."
     ),
 )
 router = PreProcessingRouter()

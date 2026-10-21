@@ -1,7 +1,10 @@
 # server.py
 import logging
+import hashlib
 import os
+import re
 import threading
+import time
 import duckdb
 import requests
 from fastapi import FastAPI, Depends, HTTPException, Header, Request
@@ -15,7 +18,9 @@ from supabase import create_client, Client, AuthApiError, AuthError
 from scripts.server.cache import cache
 
 # Import your existing agent & router modules
-from scripts.rag.agent import agent_executor, DB_PATH, DataResultPayload
+from scripts.rag.agent import agent_executor, DB_PATH
+from scripts.rag.schema import DataResultPayload
+from scripts.rag.payload import sanitize_content_field, sanitize_payload
 from scripts.rag.database import connect_duckdb, database_label
 from scripts.rag.router import PreProcessingRouter, QueryAnalysis
 
@@ -104,6 +109,85 @@ async def auth_error_handler(request: Request, exc: AuthError):
 
 
 router = PreProcessingRouter()
+
+ROUTER_CACHE_VERSION = "v1"  # bump when the router prompt or QueryAnalysis schema changes
+ROUTER_CACHE_TTL_SECONDS = 7 * 86400
+
+
+def normalize_query(query: str) -> str:
+    """Collapses case, whitespace and trailing punctuation so equivalent questions share a cache entry."""
+    return re.sub(r"\s+", " ", query.strip().casefold()).rstrip(" ?!.")
+
+
+def analyze_query(query: str) -> QueryAnalysis:
+    """Runs the pre-processing router, reusing cached analyses to avoid repeat LLM calls."""
+    digest = hashlib.sha256(normalize_query(query).encode("utf-8")).hexdigest()[:32]
+    model = os.environ.get("ANTHROPIC_ROUTER_MODEL", "claude-haiku-5-5")
+    cache_key = f"router:{ROUTER_CACHE_VERSION}:{model}:{digest}"
+
+    cached = cache.get(cache_key)
+    if cached is not None:
+        try:
+            analysis = QueryAnalysis(**cached)
+            logger.info("Router cache hit for key %s", cache_key)
+            return analysis
+        except Exception:
+            logger.warning("Ignoring invalid cached router analysis for key %s", cache_key)
+
+    analysis = router.process(query)
+    cache.set(cache_key, analysis.model_dump(), ex_seconds=ROUTER_CACHE_TTL_SECONDS)
+    return analysis
+
+
+ANSWER_CACHE_VERSION = "v1"  # bump when the agent prompt, tools or payload format change
+ANSWER_CACHE_TTL_SECONDS = 2 * 86400
+DATA_VERSION_REFRESH_SECONDS = 300
+_data_version_state = {"value": None, "checked_at": 0.0}
+
+
+def get_data_version() -> Optional[str]:
+    """Latest ingestion timestamp, so new ingests automatically invalidate cached answers."""
+    now = time.monotonic()
+    if (
+        _data_version_state["value"] is not None
+        and now - _data_version_state["checked_at"] < DATA_VERSION_REFRESH_SECONDS
+    ):
+        return _data_version_state["value"]
+
+    try:
+        conn = get_db_cursor()
+        try:
+            row = conn.execute(
+                "SELECT CAST(MAX(ingested_at) AS VARCHAR) FROM main.raw_bills"
+            ).fetchone()
+        finally:
+            conn.close()
+    except Exception as error:
+        logger.warning("Could not determine data version; answer caching disabled: %s", error)
+        return None
+
+    if not row or not row[0]:
+        return None
+    _data_version_state.update(value=row[0], checked_at=now)
+    return row[0]
+
+
+def answer_cache_key(query: str, analysis: QueryAnalysis) -> Optional[str]:
+    """Key on the normalized question, router-detected scope and data version; None disables caching."""
+    data_version = get_data_version()
+    if data_version is None:
+        return None
+    scope = f"{normalize_query(query)}|{analysis.state_code or ''}|{analysis.chamber or ''}|{data_version}"
+    digest = hashlib.sha256(scope.encode("utf-8")).hexdigest()[:32]
+    return f"chat:answer:{ANSWER_CACHE_VERSION}:{digest}"
+
+
+def is_cacheable_answer(answer: Dict[str, Any]) -> bool:
+    """Only cache real structured results, never fallbacks, empty payloads or text-only downgrades."""
+    if answer.get("display_type") not in ("table", "list", "metric"):
+        return False
+    rows = answer.get("rows")
+    return bool(rows) and all(isinstance(r, dict) and r for r in rows)
 
 CHAMBER_ALIASES = {
     "h": "house",
@@ -474,7 +558,7 @@ def get_politician_key_bills(bioguide_id: str) -> List[Dict[str, Any]]:
               bill_status AS statusCategory,
               CAST(bill_introduced_date AS VARCHAR) AS introducedDate,
               bill_latest_action_text AS latestAction,
-              bill_latest_action_date AS actionDate
+              CAST(bill_latest_action_date AS VARCHAR) AS actionDate
           FROM mart_legislative_activity
           WHERE target_member_id = ?
             AND activity_type = 'bill'
@@ -518,9 +602,26 @@ def chat_with_agent(request: ChatRequest):
 
     # Step 1: Pre-process query with Haiku Router
     try:
-        analysis: QueryAnalysis = router.process(request.query)
+        analysis: QueryAnalysis = analyze_query(request.query)
+        answer_key = answer_cache_key(request.query, analysis)
+        router_analysis = {
+            "intent": analysis.intent,
+            "detectedState": analysis.state_code or "NATIONAL",
+            "rewrittenPrompt": analysis.rewritten_prompt
+        }
 
-        # Step 2: Execute Agent Executor
+        # Step 2: Serve a previously computed answer for this data version if we have one
+        if answer_key:
+            cached_answer = cache.get(answer_key)
+            if cached_answer is not None:
+                logger.info("Chat answer cache hit for key %s", answer_key)
+                return {
+                    "routerAnalysis": router_analysis,
+                    "synthesizedAnswer": cached_answer,
+                    "cached": True,
+                }
+
+        # Step 3: Execute Agent Executor
         response = agent_executor.invoke({"messages": [("user", analysis.rewritten_prompt)]})
         print(f'Raw Response: {response}\n')
         # Extract the structured DataResultPayload generated by response_format
@@ -537,8 +638,11 @@ def chat_with_agent(request: ChatRequest):
         clean_payload = sanitize_payload(raw_payload,response=response)
         print(f'Clean Payload {clean_payload}')
         # Convert to Python dict for FastAPI JSON response
-        final_answer = clean_payload.model_dump()
+        final_answer = clean_payload.model_dump(exclude={"list_items"})
         print(f'Final Response {final_answer}')
+
+        if answer_key and is_cacheable_answer(final_answer):
+            cache.set(answer_key, final_answer, ex_seconds=ANSWER_CACHE_TTL_SECONDS)
     except AnthropicAuthenticationError as error:
         raise HTTPException(
             status_code=503,
@@ -549,118 +653,11 @@ def chat_with_agent(request: ChatRequest):
         ) from error
 
     return {
-        "routerAnalysis": {
-            "intent": analysis.intent,
-            "detectedState": analysis.state_code or "NATIONAL",
-            "rewrittenPrompt": analysis.rewritten_prompt
-        },
-        "synthesizedAnswer": final_answer
+        "routerAnalysis": router_analysis,
+        "synthesizedAnswer": final_answer,
+        "cached": False,
     }
 
-def sanitize_content_field(content: Any) -> str:
-    if isinstance(content, str):
-        return content
-    elif isinstance(content, list):
-        text_parts = []
-        for block in content:
-            if isinstance(block, str):
-                text_parts.append(block)
-            elif isinstance(block, dict) and "text" in block:
-                text_parts.append(block["text"])
-        return "\n\n".join(text_parts)
-    return str(content) if content is not None else ""
-
-
-def parse_markdown_table_to_rows(markdown_str: str) -> List[Dict[str, Any]]:
-    """Converts a Markdown table string from ToolMessage into structured row dicts."""
-    lines = [line.strip() for line in markdown_str.strip().split("\n") if line.strip()]
-    if len(lines) < 3:
-        return []
-
-    # Extract headers
-    headers = [h.strip() for h in lines[0].split("|") if h.strip()]
-    rows = []
-
-    # Parse data rows (skip index 1 divider line)
-    for line in lines[2:]:
-        if "|" in line:
-            cells = [c.strip() for c in line.split("|")[1:-1]]
-            if len(cells) == len(headers):
-                row_dict = {headers[i]: cells[i] for i in range(len(headers))}
-                rows.append(row_dict)
-
-    return rows
-
-
-def sanitize_payload(payload: DataResultPayload, response: Optional[Dict[str, Any]] = None) -> DataResultPayload:
-    """Safely cleans fields and auto-reconstructs broken/empty payload rows from execution history."""
-    if payload.summary:
-        payload.summary = sanitize_content_field(payload.summary)
-    if payload.title:
-        payload.title = sanitize_content_field(payload.title)
-
-    # -------------------------------------------------------------
-    # CASE 1: Fix Empty Metric Responses (rows = [{}])
-    # -------------------------------------------------------------
-    if payload.display_type == "metric":
-        extracted_val = None
-        import re
-        if payload.rows and len(payload.rows) > 0 and isinstance(payload.rows[0], dict) and payload.rows[0]:
-            first_row = payload.rows[0]
-            for k in ["value", "count", "total_bills", "total"]:
-                if k in first_row and first_row[k] is not None:
-                    extracted_val = str(first_row[k])
-                    break
-
-        if not extracted_val and response and "messages" in response:
-            import re
-            for msg in reversed(response["messages"]):
-                if hasattr(msg, "content") and isinstance(msg.content, str) and "|" in msg.content:
-                    # Look for the first row of numbers in the Markdown table output
-                    lines = [line.strip() for line in msg.content.split("\n") if line.strip()]
-                    for line in lines:
-                        if not line.startswith("| ---") and not "total_bills" in line and "|" in line:
-                            cells = [c.strip() for c in line.split("|") if c.strip()]
-                            # The first numeric column in the SQL output table is the main total
-                            numeric_cells = [c for c in cells if c.isdigit()]
-                            if numeric_cells:
-                                extracted_val = numeric_cells[0]
-                                break
-                if extracted_val:
-                    break
-
-        if not extracted_val and payload.summary:
-            import re
-            found_numbers = re.findall(r'\b[1-9]\d*\b', payload.summary)
-            if found_numbers:
-                extracted_val = found_numbers[0]
-
-        payload.rows = [{
-            "label": payload.title or "Total Count",
-            "value": extracted_val or "0",
-            "subtext": "Query Result"
-        }]
-
-    # -------------------------------------------------------------
-    # CASE 2: Fix Empty Table Responses (rows = [{}, {}])
-    # -------------------------------------------------------------
-    elif payload.display_type == "table":
-        # Check if rows are empty dicts
-        has_valid_rows = payload.rows and any(isinstance(r, dict) and len(r) > 0 for r in payload.rows)
-
-        if not has_valid_rows and response and "messages" in response:
-            # Scan history backwards for the last valid SQL table output
-            for msg in reversed(response["messages"]):
-                if hasattr(msg, "content") and isinstance(msg.content, str) and "|" in msg.content and "---" in msg.content:
-                    reconstructed_rows = parse_markdown_table_to_rows(msg.content)
-                    if reconstructed_rows:
-                        # Take top 10 items max
-                        payload.rows = reconstructed_rows[:10]
-                        if not payload.columns and reconstructed_rows:
-                            payload.columns = list(reconstructed_rows[0].keys())
-                        break
-
-    return payload
 
 # -------------------------------------------------------------------
 # Vote Endpoints

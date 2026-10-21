@@ -47,7 +47,7 @@ class SafeRedisCache:
         if not self.client:
             return False
         try:
-            serialized = json.dumps(value)
+            serialized = json.dumps(value, default=str)
             self.client.set(key, serialized, ex=ex_seconds)
             return True
         except Exception as e:
