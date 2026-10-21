@@ -213,7 +213,7 @@ def health_check():
 def get_politicians(state: Optional[str] = None, chamber: Optional[str] = None):
     """Fetch the member directory with pre-aggregated legislative metrics."""
     normalized_chamber = CHAMBER_ALIASES.get((chamber or "").strip().casefold())
-    cache_key = f"members:list:{(state or 'ALL').upper()}:{normalized_chamber or 'all'}"
+    cache_key = f"members:list:v2:{(state or 'ALL').upper()}:{normalized_chamber or 'all'}"
 
     # 1. Try Redis Cache
     cached_data = cache.get(cache_key)
@@ -247,10 +247,15 @@ def get_politicians(state: Optional[str] = None, chamber: Optional[str] = None):
             COALESCE(metrics.sponsored_count, 0) AS sponsoredCount,
             COALESCE(metrics.cosponsored_count, 0) AS cosponsoredCount,
             COALESCE(metrics.enacted_count, 0) AS enactedCount,
-            metrics.pass_rate AS passRate
+            metrics.pass_rate AS passRate,
+            att.total_eligible_votes AS rc_total,
+            att.missed_votes AS rc_missed,
+            att.present_abstain_votes AS rc_present
         FROM main.stg_members AS members
         LEFT JOIN main.dim_members AS metrics
             ON members.member_id = metrics.bioguide_id
+        LEFT JOIN main.mart_member_attendance AS att
+            ON members.member_id = att.member_id
         WHERE {where_sql}
         ORDER BY members.member_name ASC
         LIMIT 100;
@@ -260,6 +265,18 @@ def get_politicians(state: Optional[str] = None, chamber: Optional[str] = None):
         df = conn.execute(sql, params).fetchdf()
         conn.close()
         records = df.astype(object).where(df.notna(), None).to_dict(orient="records")
+
+        for record in records:
+            total = record.pop("rc_total")
+            missed = record.pop("rc_missed")
+            present = record.pop("rc_present")
+            record["rollCallVotes"] = None if not total else {
+                "totalVotes": total,
+                "votesCast": total - missed,
+                "missedVotes": missed,
+                "presentVotes": present,
+                "attendancePercentage": round((total - missed) / total * 100.0, 2),
+            }
 
         # 3. Store in Upstash Redis (TTL: 24 Hours)
         cache.set(cache_key, records, ex_seconds=86400)
@@ -646,8 +663,52 @@ def sanitize_payload(payload: DataResultPayload, response: Optional[Dict[str, An
     return payload
 
 # -------------------------------------------------------------------
-# Vote Endpoint
+# Vote Endpoints
 # -------------------------------------------------------------------
+
+@app.get("/api/politicians/{politician_id}/roll-call-votes")
+def get_official_roll_call_votes(politician_id: str):
+    """Returns official floor attendance and roll-call voting stats from MotherDuck."""
+    cache_key = f"votes:rollcall:{politician_id}"
+    cached_data = cache.get(cache_key)
+    if cached_data is not None:
+        return cached_data
+
+    conn = get_db_cursor()
+    query = """
+            SELECT total_eligible_votes, missed_votes, present_abstain_votes
+            FROM main.mart_member_attendance
+            WHERE member_id = ?
+            """
+    try:
+        row = conn.execute(query, [politician_id]).fetchone()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"DuckDB Query Error: {str(e)}")
+    finally:
+        conn.close()
+
+    if not row or not row[0]:
+        # No roll-call records: report unknown rather than a misleading 100% attendance
+        result = {
+            "totalVotes": 0,
+            "votesCast": 0,
+            "missedVotes": 0,
+            "presentVotes": 0,
+            "attendancePercentage": None,
+        }
+    else:
+        total, missed, present = row
+        result = {
+            "totalVotes": total,
+            "votesCast": total - missed,
+            "missedVotes": missed,
+            "presentVotes": present,
+            "attendancePercentage": round((total - missed) / total * 100.0, 2),
+        }
+
+    cache.set(cache_key, result, ex_seconds=86400)
+    return result
+
 @app.post("/api/vote")
 def submit_vote(
         request: VoteRequest,

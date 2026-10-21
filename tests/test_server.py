@@ -120,6 +120,16 @@ def _create_politicians_db(path):
     conn.execute(
         "INSERT INTO dim_members VALUES ('H1', 10, 20, 2, 20.0)"
     )
+    conn.execute("""
+        CREATE TABLE mart_member_attendance (
+            member_id VARCHAR,
+            total_eligible_votes INTEGER,
+            missed_votes INTEGER,
+            present_abstain_votes INTEGER,
+            missed_vote_pct DOUBLE
+        )
+    """)
+    conn.execute("INSERT INTO mart_member_attendance VALUES ('H1', 200, 10, 5, 5.0)")
     conn.close()
 
 
@@ -154,7 +164,15 @@ def test_politicians_without_chamber_filter_returns_all_members(
     assert house_member["cosponsoredCount"] == 20
     assert house_member["enactedCount"] == 2
     assert house_member["passRate"] == 20.0
-
+    assert house_member["rollCallVotes"] == {
+        "totalVotes": 200,
+        "votesCast": 190,
+        "missedVotes": 10,
+        "presentVotes": 5,
+        "attendancePercentage": 95.0,
+    }
+    senator = next(member for member in politicians if member["id"] == "S1")
+    assert senator["rollCallVotes"] is None
 
 def test_politicians_all_chambers_filter_includes_senate_members(
     tmp_path, monkeypatch
