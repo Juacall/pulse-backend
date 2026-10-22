@@ -94,7 +94,13 @@ class LoginResponse(BaseModel):
 # Enable CORS for Vite dev server (and production domains)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "https://legipulse.org","https://www.legipulse.org","*"],
+    allow_origins=["http://localhost:5173",
+                   "http://127.0.0.1:5173",
+                   "https://legipulse.org",
+                   "https://www.legipulse.org",
+                   "https://lettuce-verse-kindling.ngrok-free.dev",
+                   "https://legipulse-backend.internal",
+                   "https://legipulse-frontend.internal"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -357,18 +363,33 @@ def login(payload: LoginRequest):
 # POLITICIANS & DELEGATION DIRECTORY ENDPOINTS
 # -------------------------------------------------------------------
 
+from typing import Optional
+from fastapi import APIRouter, Query, HTTPException, status
+import duckdb
+
+router = APIRouter()
+
 @app.get("/api/politicians")
-def get_politicians(state: Optional[str] = None, chamber: Optional[str] = None):
-    """Fetch the member directory with pre-aggregated legislative metrics."""
+def get_politicians(
+        search: Optional[str] = Query(None, min_length=2),
+        state: Optional[str] = None,
+        chamber: Optional[str] = None,
+        limit: int = 50
+):
+    """Fetch the member directory with pre-aggregated legislative metrics and optional search."""
     normalized_chamber = CHAMBER_ALIASES.get((chamber or "").strip().casefold())
-    cache_key = f"members:list:v2:{(state or 'ALL').upper()}:{normalized_chamber or 'all'}"
+    clean_search = search.strip() if search else None
 
-    # 1. Try Redis Cache
-    cached_data = cache.get(cache_key)
-    if cached_data is not None:
-        return cached_data
+    # 1. Redis Cache Strategy:
+    # Only cache state/chamber filter results. Bypass cache if a dynamic search query is active.
+    cache_key = f"members:list:v2:{(state or 'ALL').upper()}:{normalized_chamber or 'all'}:{limit}" if not clean_search else None
 
-    # 2. Cache Miss -> Query DuckDB
+    if cache_key:
+        cached_data = cache.get(cache_key)
+        if cached_data is not None:
+            return cached_data
+
+    # 2. Query Construction
     conn = get_db_cursor()
 
     where_clauses = ["1=1"]
@@ -381,6 +402,11 @@ def get_politicians(state: Optional[str] = None, chamber: Optional[str] = None):
     if normalized_chamber:
         where_clauses.append("LOWER(TRIM(members.chamber)) = ?")
         params.append(normalized_chamber)
+
+    # Inject case-insensitive name search across member_name
+    if clean_search:
+        where_clauses.append("members.member_name ILIKE ?")
+        params.append(f"%{clean_search}%")
 
     where_sql = " AND ".join(where_clauses)
 
@@ -406,12 +432,14 @@ def get_politicians(state: Optional[str] = None, chamber: Optional[str] = None):
             ON members.member_id = att.member_id
         WHERE {where_sql}
         ORDER BY members.member_name ASC
-        LIMIT 100;
+        LIMIT ?;
     """
+    params.append(limit)
 
     try:
         df = conn.execute(sql, params).fetchdf()
         conn.close()
+
         records = df.astype(object).where(df.notna(), None).to_dict(orient="records")
 
         for record in records:
@@ -426,13 +454,18 @@ def get_politicians(state: Optional[str] = None, chamber: Optional[str] = None):
                 "attendancePercentage": round((total - missed) / total * 100.0, 2),
             }
 
-        # 3. Store in Upstash Redis (TTL: 24 Hours)
-        cache.set(cache_key, records, ex_seconds=86400)
+        # 3. Store non-search results in Upstash Redis (TTL: 24 Hours)
+        if cache_key:
+            cache.set(cache_key, records, ex_seconds=86400)
 
         return records
+
     except Exception as e:
         conn.close()
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Database Query Error: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Database Query Error: {str(e)}"
+        )
 
 @app.get("/api/politicians/{politician_id}")
 def get_politician_by_id(politician_id: str):
