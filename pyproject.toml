@@ -20,6 +20,7 @@ dependencies = [
     "pydantic>=2.12.5",
     "requests>=2.32.5",
     "sentence-transformers>=6.1.0",
+    "stripe>=16.0.0",
     "supabase>=2.33.0",
     "upstash-redis>=1.8.0",
     "uvicorn[standard]>=0.54.0",

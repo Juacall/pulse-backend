@@ -7,6 +7,7 @@ import threading
 import time
 import duckdb
 import requests
+import stripe
 from fastapi import FastAPI, Depends, HTTPException, Header, Request, status
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -30,6 +31,7 @@ logger = logging.getLogger("uvicorn.error")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SECRET_KEY") # Service role for backend DB updates
 TURNSTILE_SECRET_KEY = os.getenv("TURNSTILE_SECRET_KEY")
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
 
 supabase: Optional[Client] = (
     create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -214,6 +216,25 @@ CHAMBER_ALIASES = {
     "senate": "senate",
 }
 
+async def verify_authenticated_user(authorization: str = Header(None)) -> dict:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or malformed Authorization header")
+
+    token = authorization.split(" ")[1]
+
+    try:
+        # Validate JWT session directly via Supabase Auth
+        user_response = supabase.auth.get_user(token)
+        if not user_response or not user_response.user:
+            raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+        user = user_response.user
+        return {
+            "sub": user.id,
+            "email": user.email
+        }
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Authentication failed: {str(e)}")
 
 
 def verify_turnstile_token(token: str):
@@ -359,6 +380,96 @@ def login(payload: LoginRequest):
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid login credentials"
         )
+
+@app.post("/api/identity/create-session")
+async def create_verification_session(user: dict = Depends(verify_authenticated_user)):
+    user_id = user["sub"]  # Supabase User UUID
+    # Explicit fallback check for API key
+    if not stripe.api_key:
+        stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
+
+    if not stripe.api_key:
+        raise HTTPException(status_code=500, detail="Stripe API key is unconfigured on server.")
+
+    frontend_url = os.getenv("FRONTEND_URL", "https://lettuce-verse-kindling.ngrok-free.dev")
+    return_url = f"{frontend_url}/account?verification=success"
+    session = stripe.identity.VerificationSession.create(
+        type="document",
+        client_reference_id=user_id,  # 👈 Binds Stripe session directly to Supabase user ID
+        provided_details={
+            "email": user["email"],
+        },
+        options={
+            "document": {
+                "require_matching_selfie": True,
+                "require_address": True,
+            }
+        },
+        return_url=return_url
+    )
+    return {"client_secret": session.client_secret, "url": session.url}
+
+
+
+@app.post("/api/webhooks/stripe")
+async def stripe_webhook(request: Request):
+    payload = await request.body()
+    sig_header = request.headers.get("stripe-signature")
+
+    if not sig_header:
+        raise HTTPException(status_code=400, detail="Missing stripe-signature header")
+
+    try:
+        event = stripe.Webhook.construct_event(
+            payload, sig_header, os.getenv("STRIPE_WEBHOOK_SECRET")
+        )
+    except stripe.error.SignatureVerificationError as e:
+        print(f"Webhook signature verification failed: {e}")
+        raise HTTPException(status_code=400, detail="Invalid signature")
+    except ValueError as e:
+        print(f"Invalid webhook payload: {e}")
+        raise HTTPException(status_code=400, detail="Invalid payload")
+    except Exception as e:
+        print(f"Webhook handling error: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+    if event["type"] == "identity.verification_session.verified":
+        session = event["data"]["object"]
+        args = session.to_dict()
+        supabase_user_id = args.get("client_reference_id") # 👈 Retreive original Supabase UUID
+
+        # Fetch verified address details from Stripe Identity redacts
+        verified_outputs = args.get("verified_outputs", {})
+        address = verified_outputs.get("address", {})
+        print(address)
+        city = address.get("city")
+        state = address.get("state")
+        country = address.get("country")
+        from datetime import datetime, timezone
+        current_timestamp = datetime.now(timezone.utc).isoformat()
+
+        # Update public.profiles in Supabase
+        supabase.table("profiles").update({
+            "state_code": state,
+            "country_code": country,
+            "verified_at": current_timestamp,
+            "is_identity_verified": True,
+            "stripe_verification_id": args["id"]
+        }).eq("id", supabase_user_id).execute()
+
+        #Update Supabase Auth user_metadata (syncs session in frontend)
+        supabase.auth.admin.update_user_by_id(
+            supabase_user_id,
+            {
+                "user_metadata": {
+                    "is_identity_verified": True,
+                    "state_code": state,
+                    "city": city
+                }
+            }
+        )
+
+    return {"status": "success"}
 # -------------------------------------------------------------------
 # POLITICIANS & DELEGATION DIRECTORY ENDPOINTS
 # -------------------------------------------------------------------
