@@ -8,7 +8,9 @@ import time
 import duckdb
 import requests
 import stripe
-from fastapi import FastAPI, Depends, HTTPException, Header, Request, status
+import httpx
+from datetime import datetime, timezone
+from fastapi import FastAPI,APIRouter,Query, Depends, HTTPException, Header, Request, status,BackgroundTasks
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -24,6 +26,7 @@ from scripts.rag.schema import DataResultPayload
 from scripts.rag.payload import sanitize_content_field, sanitize_payload
 from scripts.rag.database import connect_duckdb, database_label
 from scripts.rag.router import PreProcessingRouter, QueryAnalysis
+router = APIRouter()
 
 app = FastAPI(title="Pulse API", version="1.0.0")
 logger = logging.getLogger("uvicorn.error")
@@ -69,14 +72,17 @@ def close_db_connection():
             _duckdb_conn = None
             _duckdb_path = None
 
+httpx_client = httpx.AsyncClient(timeout=3.0)
+
 class VoteRequest(BaseModel):
     politician_id: str
     vote_type: str  # 'approve', 'disapprove', or 'neutral'
-    turnstile_token: str
 
 class ChatRequest(BaseModel):
     query: str
 
+class TurnstileVerifyRequest(BaseModel):
+    turnstile_token: str
 
 class RegisterRequest(BaseModel):
     email: str
@@ -92,6 +98,13 @@ class LoginResponse(BaseModel):
     token_type: str = "bearer"
     user_id: str
     email: str
+
+# Pydantic schema matching the payload sent by PoliticianActionButtons.jsx
+class ClickEvent(BaseModel):
+    bioguide_id: str
+    button_type: str
+    destination_url: str
+    timestamp: Optional[str] = None
 
 # Enable CORS for Vite dev server (and production domains)
 app.add_middleware(
@@ -237,28 +250,7 @@ async def verify_authenticated_user(authorization: str = Header(None)) -> dict:
         raise HTTPException(status_code=401, detail=f"Authentication failed: {str(e)}")
 
 
-def verify_turnstile_token(token: str):
-    """Validates token with Cloudflare Turnstile API."""
-    if not TURNSTILE_SECRET_KEY:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Bot protection service is not configured.")
 
-    try:
-        res = requests.post(
-            "https://challenges.cloudflare.com/turnstile/v0/siteverify",
-            data={
-                "secret": TURNSTILE_SECRET_KEY,
-                "response": token
-            },
-            timeout=10,
-        )
-        outcome = res.json()
-    except Exception as e:
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Bot protection check error: {str(e)}")
-
-    if not outcome.get("success"):
-        error_codes = outcome.get("error-codes")
-        msg = f"Bot protection check failed: {', '.join(error_codes)}" if error_codes else "Bot protection check failed."
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=msg)
 
 def get_current_user(authorization: str = Header(...)):
     """Verifies Supabase JWT and checks ID verification flag."""
@@ -328,6 +320,56 @@ def health_check():
     """Simple status check for container orchestrators and AWS App Runner."""
     return {"status": "healthy", "app": "LegiPulse API"}
 
+# -------------------------------------------------------------------
+# TELEMETRY ENDPOINTS
+# -------------------------------------------------------------------
+def log_click_to_db(event_data: dict, client_ip: Optional[str], user_agent: Optional[str]):
+    """Background task to store telemetry events without blocking the HTTP response."""
+
+    if not supabase:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database service is not configured."
+        )
+    try:
+        created_at = event_data.get("timestamp") or datetime.now(timezone.utc).isoformat()
+
+        payload = {
+            "bioguide_id": event_data["bioguide_id"],
+            "button_type": event_data["button_type"],
+            "destination_url": event_data["destination_url"],
+            "client_ip": client_ip,
+            "user_agent": user_agent,
+            "clicked_at": created_at,
+        }
+
+        # Insert directly into Supabase table
+        response = supabase.table("raw_telemetry_clicks").insert(payload).execute()
+
+    except Exception as e:
+        logger.error(f"Failed to log click telemetry to Supabase: {str(e)}")
+
+
+@app.post("/api/telemetry/click", status_code=status.HTTP_204_NO_CONTENT)
+def track_click(
+        event: ClickEvent,
+        background_tasks: BackgroundTasks,
+        request: Request
+):
+
+    client_ip = request.client.host if request.client else None
+    user_agent = request.headers.get("user-agent")
+
+
+    # Pass uncalled function handle followed by its positional/keyword arguments
+    background_tasks.add_task(
+        log_click_to_db,
+        event_data=event.model_dump(),
+        client_ip=client_ip,
+        user_agent=user_agent,
+    )
+
+    return None
 
 # -------------------------------------------------------------------
 # AUTH ENDPOINTS
@@ -445,7 +487,6 @@ async def stripe_webhook(request: Request):
         city = address.get("city")
         state = address.get("state")
         country = address.get("country")
-        from datetime import datetime, timezone
         current_timestamp = datetime.now(timezone.utc).isoformat()
 
         # Update public.profiles in Supabase
@@ -470,15 +511,70 @@ async def stripe_webhook(request: Request):
         )
 
     return {"status": "success"}
+
+@app.post("/api/auth/verify-turnstile")
+async def verify_login_turnstile(payload: TurnstileVerifyRequest, req: Request):
+    # Extract original client IP (handles proxy/ngrok setups)
+
+    x_forwarded_for = req.headers.get("x-forwarded-for")
+    if x_forwarded_for:
+        client_ip = x_forwarded_for.split(",")[0].strip()
+    else:
+        client_ip = req.client.host if req.client else None
+
+    await verify_turnstile_token(payload.turnstile_token, client_ip=client_ip)
+    return {"status": "success", "message": "Bot check passed."}
+
+async def verify_turnstile_token(token: str, client_ip:str):
+    """Validates token with Cloudflare Turnstile API."""
+    if not TURNSTILE_SECRET_KEY:
+        print("❌ ERROR: CLOUDFLARE_TURNSTILE_SECRET_KEY is missing from environment variables!")
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Bot protection service is not configured.")
+
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Missing Turnstile verification token."
+        )
+
+    payload = {
+        "secret": TURNSTILE_SECRET_KEY,
+        "response": token,
+    }
+
+
+    payload["remoteip"] = client_ip
+
+    try:
+
+        res = await httpx_client.post(
+            "https://challenges.cloudflare.com/turnstile/v0/siteverify",
+            data=payload,
+        )
+        outcome = res.json()
+    except httpx.HTTPError as e:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Bot protection service unavailable: {str(e)}"
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Unexpected error during bot validation: {str(e)}"
+        )
+
+    if not outcome.get("success"):
+        error_codes = outcome.get("error-codes", [])
+        print(f"❌ Turnstile Verification Failed! Cloudflare error-codes: {errors}")
+        msg = f"Bot protection check failed: {', '.join(error_codes)}" if error_codes else "Bot protection check failed."
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=msg)
+
+    print("✅ Turnstile token verified successfully!")
+    return True
 # -------------------------------------------------------------------
 # POLITICIANS & DELEGATION DIRECTORY ENDPOINTS
 # -------------------------------------------------------------------
-
-from typing import Optional
-from fastapi import APIRouter, Query, HTTPException, status
-import duckdb
-
-router = APIRouter()
+import json
 
 @app.get("/api/politicians")
 def get_politicians(
@@ -491,14 +587,21 @@ def get_politicians(
     normalized_chamber = CHAMBER_ALIASES.get((chamber or "").strip().casefold())
     clean_search = search.strip() if search else None
 
-    # 1. Redis Cache Strategy:
-    # Only cache state/chamber filter results. Bypass cache if a dynamic search query is active.
-    cache_key = f"members:list:v2:{(state or 'ALL').upper()}:{normalized_chamber or 'all'}:{limit}" if not clean_search else None
+    # 1. Redis Cache Strategy
+    cache_key = (
+        f"members:list:v2:{(state or 'ALL').upper()}:{normalized_chamber or 'all'}:{limit}"
+        if not clean_search else None
+    )
 
     if cache_key:
-        cached_data = cache.get(cache_key)
-        if cached_data is not None:
-            return cached_data
+        try:
+            cache.delete(cache_key)
+            cached_data = cache.get(cache_key)
+            if cached_data:
+                # Upstash returns strings; parse JSON back to Python list
+                return json.loads(cached_data) if isinstance(cached_data, (str, bytes)) else cached_data
+        except Exception:
+            pass  # Fallback gracefully to DB on cache read errors
 
     # 2. Query Construction
     conn = get_db_cursor()
@@ -514,9 +617,9 @@ def get_politicians(
         where_clauses.append("LOWER(TRIM(members.chamber)) = ?")
         params.append(normalized_chamber)
 
-    # Inject case-insensitive name search across member_name
+    # DuckDB safe case-insensitive search
     if clean_search:
-        where_clauses.append("members.member_name ILIKE ?")
+        where_clauses.append("LOWER(members.member_name) LIKE LOWER(?)")
         params.append(f"%{clean_search}%")
 
     where_sql = " AND ".join(where_clauses)
@@ -528,7 +631,11 @@ def get_politicians(
             members.state_code AS state,
             members.state_name AS stateName,
             members.chamber AS chamber,
+            members.district_number AS district,
+            members.geoid_cd AS geoidCd,
             members.party_name AS party,
+            members.website_url AS website,
+            members.campaign_url AS campaign,
             COALESCE(metrics.sponsored_count, 0) AS sponsoredCount,
             COALESCE(metrics.cosponsored_count, 0) AS cosponsoredCount,
             COALESCE(metrics.enacted_count, 0) AS enactedCount,
@@ -549,34 +656,44 @@ def get_politicians(
 
     try:
         df = conn.execute(sql, params).fetchdf()
-        conn.close()
 
+        # Handle NaN to None conversions cleanly
         records = df.astype(object).where(df.notna(), None).to_dict(orient="records")
 
         for record in records:
             total = record.pop("rc_total")
             missed = record.pop("rc_missed")
             present = record.pop("rc_present")
-            record["rollCallVotes"] = None if not total else {
-                "totalVotes": total,
-                "votesCast": total - missed,
-                "missedVotes": missed,
-                "presentVotes": present,
-                "attendancePercentage": round((total - missed) / total * 100.0, 2),
-            }
 
-        # 3. Store non-search results in Upstash Redis (TTL: 24 Hours)
+            if total and total > 0:
+                votes_cast = total - (missed or 0)
+                record["rollCallVotes"] = {
+                    "totalVotes": total,
+                    "votesCast": votes_cast,
+                    "missedVotes": missed or 0,
+                    "presentVotes": present or 0,
+                    "attendancePercentage": round((votes_cast / total) * 100.0, 2),
+                }
+            else:
+                record["rollCallVotes"] = None
+
+        # 3. Store in Redis using JSON string serialization
         if cache_key:
-            cache.set(cache_key, records, ex_seconds=86400)
+            try:
+                cache.set(cache_key, json.dumps(records), ex_seconds=86400)
+            except Exception:
+                pass  # Do not block HTTP response if cache write fails
 
         return records
 
     except Exception as e:
-        conn.close()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Database Query Error: {str(e)}"
         )
+    finally:
+        # Guarantees connection cleanup
+        conn.close()
 
 @app.get("/api/politicians/{politician_id}")
 def get_politician_by_id(politician_id: str):
@@ -831,10 +948,8 @@ def chat_with_agent(request: ChatRequest):
 
         # Step 3: Execute Agent Executor
         response = agent_executor.invoke({"messages": [("user", analysis.rewritten_prompt)]})
-        print(f'Raw Response: {response}\n')
         # Extract the structured DataResultPayload generated by response_format
         raw_payload: DataResultPayload = response.get("structured_response")
-        print(f'Raw Structured Response {raw_payload}')
 
         if not raw_payload:
             raw_content = response["messages"][-1].content
@@ -844,10 +959,8 @@ def chat_with_agent(request: ChatRequest):
                 summary=sanitize_content_field(raw_content)
             )
         clean_payload = sanitize_payload(raw_payload,response=response)
-        print(f'Clean Payload {clean_payload}')
         # Convert to Python dict for FastAPI JSON response
         final_answer = clean_payload.model_dump(exclude={"list_items"})
-        print(f'Final Response {final_answer}')
 
         if answer_key and is_cacheable_answer(final_answer):
             cache.set(answer_key, final_answer, ex_seconds=ANSWER_CACHE_TTL_SECONDS)
@@ -917,37 +1030,59 @@ def get_official_roll_call_votes(politician_id: str):
 @app.post("/api/vote")
 def submit_vote(
         request: VoteRequest,
-        user_id: str = Depends(get_current_user)
+        user_id: str = Depends(get_current_user),
 ):
-    # Step 1: Validate Cloudflare Turnstile token
-    verify_turnstile_token(request.turnstile_token)
-
     if not supabase:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Database service is not configured.")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database service is not configured."
+        )
 
-    # Step 2: Execute UPSERT in Supabase PostgreSQL
     try:
+        # 1. Upsert vote in Supabase PostgreSQL
         vote_data = {
             "user_id": user_id,
             "politician_id": request.politician_id,
             "vote_type": request.vote_type
         }
 
-        # Upsert automatically updates the vote if (user_id, politician_id) already exists
         supabase.table("user_votes").upsert(
             vote_data,
             on_conflict="user_id, politician_id"
         ).execute()
 
-        # Sentiment counts are not invalidated here; the short-TTL cache expires on its own.
-        return {"status": "success", "message": "Vote recorded successfully."}
+        # 2. Invalidate old Redis cache key
+        cache_key = f"sentiment:{request.politician_id}"
+        try:
+            cache.delete(cache_key)
+        except Exception as cache_err:
+            logger.warning(f"Failed to delete Redis cache key {cache_key}: {cache_err}")
+
+        # 3. Calculate fresh database tallies
+        fresh_stats = fetch_sentiment_from_supabase(request.politician_id)
+
+        # 4. Write fresh counts back to Redis cache (30s TTL)
+        cache.set(cache_key, fresh_stats, ex_seconds=30)
+
+        # 5. Return updated tallies directly to the client
+        return {
+            "status": "success",
+            "message": "Vote recorded successfully.",
+            "user_vote": request.vote_type,
+            "sentimentStats": fresh_stats
+        }
+
     except Exception as e:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Database error: {str(e)}")
+        logger.error(f"Failed to process vote for user {user_id}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Database error: {str(e)}"
+        )
 
 def fetch_sentiment_from_supabase(politician_id: str) -> Dict[str, int]:
-    """Fallback query to aggregate votes directly from Supabase PostgreSQL."""
+    """Fallback query aggregating vote tallies efficiently."""
     try:
-        # Query vote counts grouped by vote_type
+        # Efficient aggregation query filtering directly by politician_id
         response = (
             supabase.table("user_votes")
             .select("vote_type")
@@ -956,8 +1091,6 @@ def fetch_sentiment_from_supabase(politician_id: str) -> Dict[str, int]:
         )
 
         data = response.data or []
-
-        # Calculate tallies
         stats = {"approve": 0, "neutral": 0, "disapprove": 0}
         for row in data:
             v_type = row.get("vote_type")
@@ -968,16 +1101,18 @@ def fetch_sentiment_from_supabase(politician_id: str) -> Dict[str, int]:
     except Exception as e:
         logger.error(f"Supabase vote aggregation error for {politician_id}: {e}")
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to calculate vote stats from database."
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to calculate vote stats from database."
         )
 
 
+@app.get("/api/votes/stats/{politician_id}")
 @app.get("/api/politicians/{politician_id}/votes/stats")
 def get_politician_vote_stats(politician_id: str) -> Dict[str, Any]:
-    """Fetch public aggregate vote sentiment (Upstash Redis -> Supabase Fallback)."""
+    """Fetch aggregate vote sentiment with Upstash Redis caching layer."""
     cache_key = f"sentiment:{politician_id}"
 
-    # 1. Read Path: Check Upstash Redis
+    # 1. Read Path: Check Upstash Redis Cache
     cached_stats = cache.get(cache_key)
     if cached_stats is not None:
         return {
@@ -990,7 +1125,6 @@ def get_politician_vote_stats(politician_id: str) -> Dict[str, Any]:
     stats = fetch_sentiment_from_supabase(politician_id)
 
     # 3. Write-Through: Cache in Upstash Redis (TTL: 30 seconds)
-    # Votes don't invalidate this key; it expires naturally and the next reader refreshes it from Supabase
     cache.set(cache_key, stats, ex_seconds=30)
 
     return {
@@ -998,6 +1132,8 @@ def get_politician_vote_stats(politician_id: str) -> Dict[str, Any]:
         "sentimentStats": stats,
         "source": "database"
     }
+
+
 
 if __name__ == "__main__":
     import uvicorn
