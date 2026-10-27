@@ -581,27 +581,29 @@ def get_politicians(
         search: Optional[str] = Query(None, min_length=2),
         state: Optional[str] = None,
         chamber: Optional[str] = None,
-        limit: int = 50
+        party: Optional[str] = None,
+        limit: int = 50,
 ):
-    """Fetch the member directory with pre-aggregated legislative metrics and optional search."""
+    """Fetch all politicians (members and candidates) with pre-aggregated metrics and filtering."""
     normalized_chamber = CHAMBER_ALIASES.get((chamber or "").strip().casefold())
     clean_search = search.strip() if search else None
+    clean_party = party.strip() if party and party.upper() != "ALL" else None
+    clean_state = state.strip().upper() if state and state.upper() != "ALL" else None
 
-    # 1. Redis Cache Strategy
+    # 1. Redis Cache Strategy (Exclude cache on dynamic search)
     cache_key = (
-        f"members:list:v2:{(state or 'ALL').upper()}:{normalized_chamber or 'all'}:{limit}"
-        if not clean_search else None
+        f"politicians:list:v3:{clean_state or 'ALL'}:{normalized_chamber or 'ALL'}:{clean_party or 'ALL'}:{limit}"
+        if not clean_search
+        else None
     )
 
     if cache_key:
         try:
-            cache.delete(cache_key)
             cached_data = cache.get(cache_key)
             if cached_data:
-                # Upstash returns strings; parse JSON back to Python list
                 return json.loads(cached_data) if isinstance(cached_data, (str, bytes)) else cached_data
         except Exception:
-            pass  # Fallback gracefully to DB on cache read errors
+            pass  # Fallback gracefully to DB query on cache read error
 
     # 2. Query Construction
     conn = get_db_cursor()
@@ -609,62 +611,67 @@ def get_politicians(
     where_clauses = ["1=1"]
     params = []
 
-    if state and state.upper() != "ALL":
-        where_clauses.append("members.state_code = ?")
-        params.append(state.upper())
+    if clean_state:
+        where_clauses.append("p.state = ?")
+        params.append(clean_state)
 
     if normalized_chamber:
-        where_clauses.append("LOWER(TRIM(members.chamber)) = ?")
+        where_clauses.append("LOWER(TRIM(p.chamber)) = ?")
         params.append(normalized_chamber)
 
-    # DuckDB safe case-insensitive search
+    if clean_party:
+        where_clauses.append("LOWER(TRIM(p.party)) = LOWER(?)")
+        params.append(clean_party)
+
+    # Case-insensitive name search across dim_politicians
     if clean_search:
-        where_clauses.append("LOWER(members.member_name) LIKE LOWER(?)")
+        where_clauses.append("LOWER(p.name) LIKE LOWER(?)")
         params.append(f"%{clean_search}%")
 
     where_sql = " AND ".join(where_clauses)
 
     sql = f"""
-        SELECT 
-            members.member_id AS id,
-            members.member_name AS name,
-            members.state_code AS state,
-            members.state_name AS stateName,
-            members.chamber AS chamber,
-            members.district_number AS district,
-            members.geoid_cd AS geoidCd,
-            members.party_name AS party,
-            members.website_url AS website,
-            members.campaign_url AS campaign,
-            COALESCE(metrics.sponsored_count, 0) AS sponsoredCount,
-            COALESCE(metrics.cosponsored_count, 0) AS cosponsoredCount,
-            COALESCE(metrics.enacted_count, 0) AS enactedCount,
-            metrics.pass_rate AS passRate,
-            att.total_eligible_votes AS rc_total,
-            att.missed_votes AS rc_missed,
-            att.present_abstain_votes AS rc_present
-        FROM main.stg_members AS members
-        LEFT JOIN main.dim_members AS metrics
-            ON members.member_id = metrics.bioguide_id
-        LEFT JOIN main.mart_member_attendance AS att
-            ON members.member_id = att.member_id
-        WHERE {where_sql}
-        ORDER BY members.member_name ASC
-        LIMIT ?;
+            SELECT 
+                p.id                        AS id,
+                p.name                      AS name,
+                p.state                     AS state,
+                p.chamber                   AS chamber,
+                p.district                  AS district,
+                p.party                     AS party,
+                p.website                   AS website,
+                p.campaign                  AS campaign,
+                p.is_incumbent              AS isIncumbent,
+                p.status                    AS status,
+                COALESCE(p.sponsored_count, 0)   AS sponsoredCount,
+                COALESCE(p.cosponsored_count, 0) AS cosponsoredCount,
+                COALESCE(p.enacted_count, 0)     AS enactedCount,
+                p.pass_rate                 AS passRate,
+                COALESCE(p.total_receipts, 0.0)  AS totalReceipts,
+                p.first_file_date           AS firstFileDate,
+                att.total_eligible_votes    AS rc_total,
+                att.missed_votes            AS rc_missed,
+                att.present_abstain_votes   AS rc_present
+            FROM main.dim_politicians AS p
+            LEFT JOIN main.mart_member_attendance AS att
+                ON p.bioguide_id = att.member_id AND p.is_incumbent = TRUE
+            WHERE {where_sql}
+            ORDER BY p.name ASC
+            LIMIT ?;
     """
     params.append(limit)
 
     try:
         df = conn.execute(sql, params).fetchdf()
 
-        # Handle NaN to None conversions cleanly
+        # Clean NaN values for JSON compatibility
         records = df.astype(object).where(df.notna(), None).to_dict(orient="records")
 
         for record in records:
-            total = record.pop("rc_total")
-            missed = record.pop("rc_missed")
-            present = record.pop("rc_present")
+            total = record.pop("rc_total", None)
+            missed = record.pop("rc_missed", None)
+            present = record.pop("rc_present", None)
 
+            # Build attendance metrics for sitting incumbents
             if total and total > 0:
                 votes_cast = total - (missed or 0)
                 record["rollCallVotes"] = {
@@ -677,12 +684,16 @@ def get_politicians(
             else:
                 record["rollCallVotes"] = None
 
-        # 3. Store in Redis using JSON string serialization
+            # Format firstFileDate string safely for JS ISO consumption (YYYY-MM-DD)
+            if record.get("firstFileDate"):
+                record["firstFileDate"] = str(record["firstFileDate"])
+
+        # 3. Cache response payload in Redis
         if cache_key:
             try:
                 cache.set(cache_key, json.dumps(records), ex_seconds=86400)
             except Exception:
-                pass  # Do not block HTTP response if cache write fails
+                pass
 
         return records
 
@@ -692,7 +703,6 @@ def get_politicians(
             detail=f"Database Query Error: {str(e)}"
         )
     finally:
-        # Guarantees connection cleanup
         conn.close()
 
 @app.get("/api/politicians/{politician_id}")
@@ -711,8 +721,8 @@ def get_politician_by_id(politician_id: str):
         sql = """
               SELECT bioguide_id AS id, name, party, state, chamber,
                      district, office_address, phone, website_url
-              FROM main.members
-              WHERE bioguide_id = ? \
+              FROM main.dim_politicians
+              WHERE politician_id = ? 
               """
         row = conn.execute(sql, [politician_id]).fetchone()
 
@@ -765,7 +775,7 @@ def get_politician_donors(politician_id: str, cycle: Optional[int] = None):
         donor_table = conn.execute("""
                                    SELECT COUNT(*)
                                    FROM information_schema.tables
-                                   WHERE table_schema = 'main' AND table_name = 'member_top_donors'
+                                   WHERE table_schema = 'main' AND table_name = 'politician_top_donors'
                                    """).fetchone()[0]
         if not donor_table:
             raise HTTPException(
@@ -775,8 +785,8 @@ def get_politician_donors(politician_id: str, cycle: Optional[int] = None):
 
         sql = """
               SELECT donor_name AS donorName, amount, industry, cycle
-              FROM main.member_top_donors
-              WHERE bioguide_id = ? \
+              FROM main.stg_fec_donors
+              WHERE politician_id = ? 
               """
         params = [politician_id]
         if cycle is not None:
@@ -815,7 +825,7 @@ def get_politician_donation_summary(politician_id: str):
         summary_table = conn.execute("""
                                      SELECT COUNT(*)
                                      FROM information_schema.tables
-                                     WHERE table_schema = 'main' AND table_name = 'member_fec_summary'
+                                     WHERE table_schema = 'main' AND table_name = 'politician_fec_summary'
                                      """).fetchone()[0]
         if not summary_table:
             raise HTTPException(
@@ -827,8 +837,8 @@ def get_politician_donation_summary(politician_id: str):
             """
             SELECT fec_candidate_id, total_receipts, pac_contributions,
                    individual_contributions, coverage_end_date
-            FROM main.member_fec_summary
-            WHERE bioguide_id = ?
+            FROM main.politician_fec_summary
+            WHERE politician_id = ?
             """,
             [politician_id],
         ).fetchone()
