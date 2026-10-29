@@ -26,6 +26,7 @@ from scripts.rag.schema import DataResultPayload
 from scripts.rag.payload import sanitize_content_field, sanitize_payload
 from scripts.rag.database import connect_duckdb, database_label
 from scripts.rag.router import PreProcessingRouter, QueryAnalysis
+from scripts.server.rate_limiter import RateLimiter
 router = APIRouter()
 
 app = FastAPI(title="Pulse API", version="1.0.0")
@@ -47,6 +48,9 @@ _duckdb_conn: Optional[duckdb.DuckDBPyConnection] = None
 _duckdb_path: Optional[str] = None
 _duckdb_lock = threading.Lock()
 
+standard_limiter = RateLimiter(requests_per_minute=120, burst_limit=30)
+search_limiter = RateLimiter(requests_per_minute=30, burst_limit=10)
+ai_console_limiter = RateLimiter(requests_per_minute=5, burst_limit=2)
 
 def get_db_cursor() -> duckdb.DuckDBPyConnection:
     """Return a per-request cursor on the worker's shared read-only DuckDB connection."""
@@ -576,40 +580,166 @@ async def verify_turnstile_token(token: str, client_ip:str):
 # -------------------------------------------------------------------
 import json
 
-@app.get("/api/politicians")
-def get_politicians(
-        search: Optional[str] = Query(None, min_length=2),
+def fetch_vote_aggregates_from_supabase() -> Dict[str, Dict[str, int]]:
+    """
+    Query Supabase for aggregated vote counts per politician.
+    Returns: { "bioguide_id_123": {"approve": 12, "disapprove": 2, "neutral": 1}, ... }
+    """
+    # RPC call or SQL query grouping by politician_id
+    response = supabase.rpc("get_politician_vote_counts",{}).execute()
+    vote_map = {}
+    for row in response.data:
+        p_id = row["politician_id"]
+        vote_map[p_id] = {
+            "approve": row.get("approve_count", 0),
+            "disapprove": row.get("disapprove_count", 0),
+            "neutral": row.get("neutral_count", 0),
+        }
+
+    return vote_map
+
+@app.get("/api/politicians/list", dependencies=[Depends(standard_limiter)])
+def get_politicians_list(
+        state: Optional[str] = None,
+        limit: Optional[int] = Query(None, ge=1, le=500),
+):
+    """
+    Returns politicians for state-based client caching:
+    - If `state` is ALL/None: returns top 50 incumbents for initial dashboard render.
+    - If `state` is provided (e.g., 'CA'): returns the full state dataset for local UI filtering.
+    """
+    clean_state = state.strip().upper() if state and state.upper() != "ALL" else None
+
+    # Apply limit of 50 only when requesting 'ALL' states
+    effective_limit = limit if limit is not None else (None if clean_state else 50)
+
+    # Bump cache version key to invalidate stale payloads lacking votesWithParty
+    cache_key = f"politicians:list:v5:{clean_state or 'ALL'}:{effective_limit or 'unlimited'}"
+
+    try:
+        cached_data = cache.get(cache_key)
+        if cached_data:
+            return json.loads(cached_data) if isinstance(cached_data, (str, bytes)) else cached_data
+    except Exception:
+        pass  # Fallback to DB query on cache error
+
+    conn = get_db_cursor()
+    where_clauses = ["1=1"]
+    params = []
+
+    if clean_state:
+        where_clauses.append("p.state = ?")
+        params.append(clean_state)
+
+    where_sql = " AND ".join(where_clauses)
+
+    sql = f"""
+        SELECT 
+            p.id                        AS id,
+            p.name                      AS name,
+            p.state                     AS state,
+            p.chamber                   AS chamber,
+            p.district                  AS district,
+            p.party                     AS party,
+            p.website                   AS website,
+            p.campaign                  AS campaign,
+            COALESCE(p.imageUrl)        AS imageUrl,
+            p.is_incumbent              AS isIncumbent,
+            p.status                    AS status,    
+            COALESCE(p.sponsored_count, 0)   AS sponsoredCount,
+            COALESCE(p.cosponsored_count, 0) AS cosponsoredCount,
+            COALESCE(p.enacted_count, 0)     AS enactedCount,
+            p.pass_rate                 AS passRate,
+            COALESCE(p.total_receipts, 0.0)  AS totalReceipts,
+            p.first_file_date           AS firstFileDate,
+            att.total_eligible_votes    AS rc_total,
+            att.missed_votes            AS rc_missed,
+            att.present_abstain_votes   AS rc_present,
+            pl.party_loyalty_pct        AS votesWithParty
+        FROM main.dim_politicians AS p
+        LEFT JOIN main.mart_member_attendance AS att
+            ON p.bioguide_id = att.member_id AND p.is_incumbent = TRUE
+        LEFT JOIN main.mart_party_loyalty AS pl
+            ON p.bioguide_id = pl.member_id AND p.is_incumbent = TRUE
+        WHERE {where_sql}
+        ORDER BY p.is_incumbent DESC, p.name ASC
+    """
+
+    if effective_limit:
+        sql += " LIMIT ?"
+        params.append(effective_limit)
+
+    try:
+        df = conn.execute(sql, params).fetchdf()
+        records = df.astype(object).where(df.notna(), None).to_dict(orient="records")
+        sentiment_vote_map = fetch_vote_aggregates_from_supabase()
+
+        for record in records:
+            p_id = record["id"]
+            total = record.pop("rc_total", None)
+            missed = record.pop("rc_missed", None)
+            present = record.pop("rc_present", None)
+
+            if total and total > 0:
+                votes_cast = total - (missed or 0)
+                record["rollCallVotes"] = {
+                    "totalVotes": total,
+                    "votesCast": votes_cast,
+                    "missedVotes": missed or 0,
+                    "presentVotes": present or 0,
+                    "attendancePercentage": round((votes_cast / total) * 100.0, 2),
+                }
+            else:
+                record["rollCallVotes"] = None
+
+            if record.get("firstFileDate"):
+                record["firstFileDate"] = str(record["firstFileDate"])
+
+            stats = sentiment_vote_map.get(p_id, {"approve": 0, "disapprove": 0, "neutral": 0})
+            stats["totalVotes"] = stats["approve"] + stats["disapprove"] + stats["neutral"]
+            record["sentimentStats"] = stats
+
+            # Format votesWithParty to 1 decimal place or integer
+            raw_loyalty = record.get("votesWithParty")
+            if raw_loyalty is not None:
+                record["votesWithParty"] = round(float(raw_loyalty), 1)
+
+        try:
+            cache.set(cache_key, json.dumps(records), ex=86400)
+        except Exception:
+            pass
+
+        return records
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Database Query Error: {str(e)}"
+        )
+    finally:
+        conn.close()
+
+
+@app.get("/api/politicians/search", dependencies=[Depends(search_limiter)])
+def search_politicians(
+        q: str = Query(..., min_length=2, description="Search query string"),
         state: Optional[str] = None,
         chamber: Optional[str] = None,
         party: Optional[str] = None,
-        limit: int = 50,
+        candidate_status: Optional[str] = Query(None, alias="status"),
+        limit: int = Query(50, ge=1, le=200),
 ):
-    """Fetch all politicians (members and candidates) with pre-aggregated metrics and filtering."""
+    """Executes a targeted search query across all candidates with active filter parameters."""
     normalized_chamber = CHAMBER_ALIASES.get((chamber or "").strip().casefold())
-    clean_search = search.strip() if search else None
+    clean_search = q.strip()
     clean_party = party.strip() if party and party.upper() != "ALL" else None
     clean_state = state.strip().upper() if state and state.upper() != "ALL" else None
+    clean_status = candidate_status.strip() if candidate_status and candidate_status.upper() != "ALL" else None
 
-    # 1. Redis Cache Strategy (Exclude cache on dynamic search)
-    cache_key = (
-        f"politicians:list:v3:{clean_state or 'ALL'}:{normalized_chamber or 'ALL'}:{clean_party or 'ALL'}:{limit}"
-        if not clean_search
-        else None
-    )
-
-    if cache_key:
-        try:
-            cached_data = cache.get(cache_key)
-            if cached_data:
-                return json.loads(cached_data) if isinstance(cached_data, (str, bytes)) else cached_data
-        except Exception:
-            pass  # Fallback gracefully to DB query on cache read error
-
-    # 2. Query Construction
     conn = get_db_cursor()
 
-    where_clauses = ["1=1"]
-    params = []
+    where_clauses = ["LOWER(p.name) LIKE LOWER(?)"]
+    params = [f"%{clean_search}%"]
 
     if clean_state:
         where_clauses.append("p.state = ?")
@@ -623,55 +753,62 @@ def get_politicians(
         where_clauses.append("LOWER(TRIM(p.party)) = LOWER(?)")
         params.append(clean_party)
 
-    # Case-insensitive name search across dim_politicians
-    if clean_search:
-        where_clauses.append("LOWER(p.name) LIKE LOWER(?)")
-        params.append(f"%{clean_search}%")
+    if clean_status:
+        target_status = clean_status.lower()
+        if target_status == "incumbent":
+            where_clauses.append("(p.is_incumbent = TRUE OR LOWER(p.status) = 'incumbent')")
+        elif target_status == "challenger":
+            where_clauses.append("(LOWER(p.status) = 'challenger' OR (p.is_incumbent = FALSE OR LOWER(p.status) = 'candidate'))")
+        elif target_status == "open":
+            where_clauses.append("LOWER(p.status) IN ('open', 'open_seat')")
 
     where_sql = " AND ".join(where_clauses)
 
     sql = f"""
-            SELECT 
-                p.id                        AS id,
-                p.name                      AS name,
-                p.state                     AS state,
-                p.chamber                   AS chamber,
-                p.district                  AS district,
-                p.party                     AS party,
-                p.website                   AS website,
-                p.campaign                  AS campaign,
-                p.is_incumbent              AS isIncumbent,
-                p.status                    AS status,
-                COALESCE(p.sponsored_count, 0)   AS sponsoredCount,
-                COALESCE(p.cosponsored_count, 0) AS cosponsoredCount,
-                COALESCE(p.enacted_count, 0)     AS enactedCount,
-                p.pass_rate                 AS passRate,
-                COALESCE(p.total_receipts, 0.0)  AS totalReceipts,
-                p.first_file_date           AS firstFileDate,
-                att.total_eligible_votes    AS rc_total,
-                att.missed_votes            AS rc_missed,
-                att.present_abstain_votes   AS rc_present
-            FROM main.dim_politicians AS p
-            LEFT JOIN main.mart_member_attendance AS att
-                ON p.bioguide_id = att.member_id AND p.is_incumbent = TRUE
-            WHERE {where_sql}
-            ORDER BY p.name ASC
-            LIMIT ?;
+        SELECT 
+            p.id                        AS id,
+            p.name                      AS name,
+            p.state                     AS state,
+            p.chamber                   AS chamber,
+            p.district                  AS district,
+            p.party                     AS party,
+            p.website                   AS website,
+            p.campaign                  AS campaign,
+            COALESCE(p.imageUrl)        AS imageUrl,
+            p.is_incumbent              AS isIncumbent,
+            p.status                    AS status,    
+            COALESCE(p.sponsored_count, 0)   AS sponsoredCount,
+            COALESCE(p.cosponsored_count, 0) AS cosponsoredCount,
+            COALESCE(p.enacted_count, 0)     AS enactedCount,
+            p.pass_rate                 AS passRate,
+            COALESCE(p.total_receipts, 0.0)  AS totalReceipts,
+            p.first_file_date           AS firstFileDate,
+            att.total_eligible_votes    AS rc_total,
+            att.missed_votes            AS rc_missed,
+            att.present_abstain_votes   AS rc_present,
+            pl.party_loyalty_pct        AS votesWithParty
+        FROM main.dim_politicians AS p
+        LEFT JOIN main.mart_member_attendance AS att
+            ON p.bioguide_id = att.member_id AND p.is_incumbent = TRUE
+        LEFT JOIN main.mart_party_loyalty AS pl
+            ON p.bioguide_id = pl.member_id AND p.is_incumbent = TRUE
+        WHERE {where_sql}
+        ORDER BY p.is_incumbent DESC, p.name ASC
+        LIMIT ?;
     """
     params.append(limit)
 
     try:
         df = conn.execute(sql, params).fetchdf()
-
-        # Clean NaN values for JSON compatibility
         records = df.astype(object).where(df.notna(), None).to_dict(orient="records")
+        sentiment_vote_map = fetch_vote_aggregates_from_supabase()
 
         for record in records:
+            p_id = record["id"]
             total = record.pop("rc_total", None)
             missed = record.pop("rc_missed", None)
             present = record.pop("rc_present", None)
 
-            # Build attendance metrics for sitting incumbents
             if total and total > 0:
                 votes_cast = total - (missed or 0)
                 record["rollCallVotes"] = {
@@ -684,17 +821,17 @@ def get_politicians(
             else:
                 record["rollCallVotes"] = None
 
-            # Format firstFileDate string safely for JS ISO consumption (YYYY-MM-DD)
             if record.get("firstFileDate"):
                 record["firstFileDate"] = str(record["firstFileDate"])
 
-        # 3. Cache response payload in Redis
-        if cache_key:
-            try:
-                cache.set(cache_key, json.dumps(records), ex_seconds=86400)
-            except Exception:
-                pass
+            stats = sentiment_vote_map.get(p_id, {"approve": 0, "disapprove": 0, "neutral": 0})
+            stats["totalVotes"] = stats["approve"] + stats["disapprove"] + stats["neutral"]
+            record["sentimentStats"] = stats
 
+            # Format votesWithParty to 1 decimal place or integer
+            raw_loyalty = record.get("votesWithParty")
+            if raw_loyalty is not None:
+                record["votesWithParty"] = round(float(raw_loyalty), 1)
         return records
 
     except Exception as e:
@@ -705,7 +842,7 @@ def get_politicians(
     finally:
         conn.close()
 
-@app.get("/api/politicians/{politician_id}")
+@app.get("/api/politicians/{politician_id}", dependencies=[Depends(standard_limiter)])
 def get_politician_by_id(politician_id: str):
     """Fetch detailed metadata for a single politician by bioguide ID."""
     cache_key = f"member:profile:{politician_id}"
@@ -929,7 +1066,7 @@ def get_politician_key_bills(bioguide_id: str) -> List[Dict[str, Any]]:
 # RAG AGENT EXECUTION ENDPOINT
 # -------------------------------------------------------------------
 
-@app.post("/api/chat")
+@app.post("/api/chat", dependencies=[Depends(ai_console_limiter)] )
 def chat_with_agent(request: ChatRequest):
     """Runs input through PreProcessingRouter before invoking the LangChain agent."""
     if not request.query.strip():
