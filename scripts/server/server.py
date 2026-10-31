@@ -104,6 +104,24 @@ class LoginResponse(BaseModel):
     user_id: str
     email: str
 
+class CandidateResult(BaseModel):
+    politician_id: str
+    name: str
+    party: str
+    office: str  # 'H' or 'S'
+    district: Optional[str] = None
+    total_receipts: float
+    votes_received: Optional[int] = 0
+    vote_share_pct: Optional[float] = 0.0
+    is_winner: Optional[bool] = False
+    is_incumbent: bool
+
+class StateElectionResponse(BaseModel):
+    state_code: str
+    election_cycle: int
+    total_races: int
+    candidates: List[CandidateResult]
+
 # Pydantic schema matching the payload sent by PoliticianActionButtons.jsx
 class ClickEvent(BaseModel):
     bioguide_id: str
@@ -338,7 +356,7 @@ def get_authenticated_user_id(authorization: str = Header(...)) -> str:
     token = authorization.split(" ", 1)[1].strip()
 
     try:
-        user_res = supabase_admin.auth.get_user(token)
+        user_res = supabase.auth.get_user(token)
         if not user_res or not user_res.user:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token.")
         return user_res.user.id
@@ -412,66 +430,99 @@ def track_click(
 # -------------------------------------------------------------------
 # AUTH ENDPOINTS
 # -------------------------------------------------------------------
+@app.get("/api/usersummary",response_model=UserSummaryResponse)
+def get_user_summary(current_user: str = Depends(get_current_user)):
+    """
+    Returns user profile, Stripe verification status, and a mapping of
+    politician_id -> vote_type for the authenticated user.
+    Leverages Redis caching for fast state hydration on app load.
+    """
+    user_id = current_user
+    if not user_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User identity could not be verified."
+        )
+    cache_key = f"user:{user_id}:summary"
 
-@app.get("/status")
-async def check_verification_status(user_id: str = Depends(get_authenticated_user_id)):
-    """
-    Queries Supabase for 'stripe_verification_id', verifies session state
-    with Stripe, and performs self-healing sync on 'is_identity_verified'.
-    """
+    # 1. Check Redis Cache First
     try:
-        # 1. Fetch profile from Supabase
+        cached_data = cache.get(cache_key)
+        if cached_data:
+            if isinstance(cached_data, (bytes, bytearray)):
+                cached_data = cached_data.decode("utf-8")
+            return json.loads(cached_data) if isinstance(cached_data, str) else cached_data
+    except Exception as err:
+        logger.warning(f"Redis read error for user summary (user_id={user_id}): {err}")
+
+    # 2. Query Supabase (Profile Verification & User Votes)
+    try:
+        # Fetch profile verification data
         profile_res = (
-            supabase_admin.table("profiles")
+            supabase.table("profiles")
             .select("is_identity_verified, stripe_verification_id")
             .eq("id", user_id)
             .single()
             .execute()
         )
 
-        profile = profile_res.data
-        if not profile:
-            raise HTTPException(status_code=404, detail="User profile not found.")
+        # Fetch voting history
+        votes_res = (
+            supabase.table("user_votes")
+            .select("politician_id, vote_type")
+            .eq("user_id", user_id)
+            .execute()
+        )
+        profile_data = profile_res.data or {}
+        raw_votes = votes_res.data or []
 
-        verification_id = profile.get("stripe_verification_id")
+        is_verified = profile_data.get("is_identity_verified", False)
+        stripe_verification_id = profile_data.get("stripe_verification_id")
 
-        # 2. Return unverified if no session ID exists yet
-        if not verification_id:
-            return {
-                "is_verified": False,
-                "status": "unverified",
-                "verification_id": None,
-                "message": "No verification session has been started."
-            }
+        # 3. Stripe Self-Healing Check
+        # If DB status is False but a Stripe session exists, verify status directly with Stripe
+        if stripe_verification_id and not is_verified:
+            try:
+                session = stripe.identity.VerificationSession.retrieve(stripe_verification_id)
+                if session.get("status") == "verified":
+                    is_verified = True
+                    # Sync updated state back to Supabase
+                    supabase.table("profiles").update(
+                        {"is_identity_verified": True}
+                    ).eq("id", user_id).execute()
+            except stripe.error.StripeError as stripe_err:
+                logger.error(f"Failed to check Stripe verification status for session {stripe_verification_id}: {stripe_err}")
 
-        # 3. Retrieve live VerificationSession status from Stripe
-        session = stripe.identity.VerificationSession.retrieve(verification_id)
-        session_status = session.get("status")  # verified, requires_input, processing, canceled
-        is_verified = (session_status == "verified")
+        # Construct vote map: { "politician_id_123": "YEA", "politician_id_456": "NAY" }
+        vote_map = {row["politician_id"]: row["vote_type"] for row in raw_votes}
 
-        # 4. Self-healing sync: update Supabase if the DB flag is behind Stripe's status
-        if is_verified != profile.get("is_identity_verified"):
-            supabase_admin.table("profiles").update(
-                {"is_identity_verified": is_verified}
-            ).eq("id", user_id).execute()
-
-        return {
-            "is_verified": is_verified,
-            "status": session_status,
-            "verification_id": verification_id,
-            "last_error": session.get("last_error")
+        # Build payload
+        summary_payload = {
+            "user_id": user_id,
+            "is_identity_verified": is_verified,
+            "stripe_verification_id": stripe_verification_id,
+            "votes_map": vote_map
         }
 
-    except stripe.error.StripeError as e:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Stripe API error: {str(e)}"
-        )
+        # 4. Write back to Redis Cache
+        try:
+            cache.set(
+                cache_key,
+                json.dumps(summary_payload),
+                ex_seconds=CACHE_TTL_USER_VOTES
+            )
+        except Exception as err:
+            logger.warning(f"Redis write error for user summary (user_id={user_id}): {err}")
+
+        return summary_payload
+
     except Exception as e:
+        logger.error(f"Failed to fetch user summary for user_id={user_id}: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Server error: {str(e)}"
+            detail=f"Failed to retrieve user voting and verification records: {str(e)}"
         )
+
 
 
 @app.post("/api/identity/create-session")
@@ -484,7 +535,7 @@ async def create_verification_session(user: dict = Depends(verify_authenticated_
     if not stripe.api_key:
         raise HTTPException(status_code=500, detail="Stripe API key is unconfigured on server.")
 
-    frontend_url = os.getenv("FRONTEND_URL", "https://lettuce-verse-kindling.ngrok-free.dev")
+    frontend_url = os.getenv("FRONTEND_URL")
     return_url = f"{frontend_url}/account?verification=success"
     session = stripe.identity.VerificationSession.create(
         type="document",
@@ -628,6 +679,7 @@ async def verify_turnstile_token(token: str, client_ip:str):
 
     print("✅ Turnstile token verified successfully!")
     return True
+
 # -------------------------------------------------------------------
 # POLITICIANS & DELEGATION DIRECTORY ENDPOINTS
 # -------------------------------------------------------------------
@@ -1239,7 +1291,7 @@ def get_user_summary(current_user: str = Depends(get_current_user)):
                 if session.get("status") == "verified":
                     is_verified = True
                     # Sync updated state back to Supabase
-                    supabase_admin.table("profiles").update(
+                    supabase.table("profiles").update(
                         {"is_identity_verified": True}
                     ).eq("id", user_id).execute()
             except stripe.error.StripeError as stripe_err:
@@ -1438,7 +1490,86 @@ def get_politician_vote_stats(politician_id: str) -> Dict[str, Any]:
         "sentimentStats": stats,
         "source": "database"
     }
+# -------------------------------------------------------------------
+# Election Endpoints
+# -------------------------------------------------------------------
+@app.get("/state", response_model=StateElectionResponse)
+def get_state_elections(
+        state_code: str = Query(..., max_length=2, description="Two-letter state code, e.g. WA"),
+        cycle: int = Query(2026, description="Election cycle year")
+):
+    """
+    Fetches active election contenders and results for a given state.
+    Leverages Redis caching for instant state-switching.
+    """
+    state_clean = state_code.upper().strip()
+    cache_key = f"elections:{cycle}:{state_clean}"
 
+    # 1. Try reading from Redis cache
+    cached_payload = cache.get(cache_key)
+    if cached_payload:
+        return cached_payload
+
+    # 2. Query DuckDB for Candidates & Results
+    try:
+        conn = duckdb.connect(DUCKDB_PATH, read_only=True)
+
+        query = """
+                SELECT
+                    p.id AS politician_id,
+                    p.name,
+                    p.party,
+                    p.office,
+                    p.district,
+                    COALESCE(p.total_receipts, 0.0) AS total_receipts,
+                    COALESCE(r.votes_received, 0) AS votes_received,
+                    COALESCE(r.vote_share_pct, 0.0) AS vote_share_pct,
+                    COALESCE(r.is_winner, FALSE) AS is_winner,
+                    COALESCE(p.is_incumbent, FALSE) AS is_incumbent
+                FROM main_dbt.dim_politicians p
+                         LEFT JOIN main_dbt.fct_election_results r
+                                   ON p.id = r.politician_id
+                                       AND r.election_cycle = ?
+                WHERE p.state = ?
+                ORDER BY p.office DESC, p.district ASC, total_receipts DESC; \
+                """
+
+        rows = conn.execute(query, [cycle, state_clean]).fetchall()
+        conn.close()
+
+        candidates = [
+            CandidateResult(
+                politician_id=row[0],
+                name=row[1],
+                party=row[2],
+                office=row[3],
+                district=row[4],
+                total_receipts=row[5],
+                votes_received=row[6],
+                vote_share_pct=row[7],
+                is_winner=row[8],
+                is_incumbent=row[9]
+            )
+            for row in rows
+        ]
+
+        payload = {
+            "state_code": state_clean,
+            "election_cycle": cycle,
+            "total_races": len(candidates),
+            "candidates": candidates
+        }
+
+        # 3. Cache in Redis for 1 hour (3600s)
+        cache.set(cache_key, payload, ex_seconds=3600)
+        return payload
+
+    except Exception as e:
+        logger.error(f"Error fetching election data for {state_clean}: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to load election data for {state_clean}"
+        )
 def invalidate_user_cache(user_id: str):
     """Purges cached user summary keys from Redis."""
     try:
@@ -1450,6 +1581,7 @@ def invalidate_user_cache(user_id: str):
         logger.info(f"Successfully invalidated Redis cache for user_id={user_id}")
     except Exception as err:
         logger.warning(f"Failed to invalidate Redis cache for user_id={user_id}: {err}")
+
 
 
 if __name__ == "__main__":
