@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from fastapi import FastAPI, Query, Depends, HTTPException, Header, Request, status, BackgroundTasks
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Any, Dict, List, Optional
 from langchain_anthropic.chat_models import AnthropicAuthenticationError
 from supabase import create_client, Client, AuthApiError, AuthError
@@ -36,6 +36,7 @@ SUPABASE_KEY = os.getenv("SUPABASE_SECRET_KEY") # Service role for backend DB up
 TURNSTILE_SECRET_KEY = os.getenv("TURNSTILE_SECRET_KEY")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
 CACHE_TTL_USER_VOTES = 86400
+CACHE_TTL_ELECTIONS = 3600  # Cache duration: 1 hour (3600 seconds)
 
 supabase: Optional[Client] = (
     create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -104,23 +105,34 @@ class LoginResponse(BaseModel):
     user_id: str
     email: str
 
-class CandidateResult(BaseModel):
-    politician_id: str
-    name: str
-    party: str
-    office: str  # 'H' or 'S'
-    district: Optional[str] = None
-    total_receipts: float
-    votes_received: Optional[int] = 0
-    vote_share_pct: Optional[float] = 0.0
-    is_winner: Optional[bool] = False
-    is_incumbent: bool
+class ElectionCandidateResponse(BaseModel):
+    politician_id: str = Field(..., description="Unique FEC candidate ID or Bioguide ID")
+    name: str = Field(..., description="Full legal candidate name")
+    party: str = Field(..., description="Normalized party affiliation, e.g. Democratic, Republican")
+    is_incumbent: bool = Field(default=False, description="True if currently holding the office")
+    campaign_url: Optional[str] = Field(None, description="Verified campaign website URL")
+    total_receipts: float = Field(default=0.0, description="Total campaign funds raised from FEC filings")
 
-class StateElectionResponse(BaseModel):
-    state_code: str
-    election_cycle: int
-    total_races: int
-    candidates: List[CandidateResult]
+    class Config:
+        from_attributes = True
+
+class ElectionSlateResponse(BaseModel):
+    election_id: str = Field(..., example="2026_WA_H_01", description="Composite election slate key")
+    office: str = Field(..., example="House", description="Office sought: 'House' or 'Senate'")
+    district: str = Field(..., example="01", description="Two-character district code ('00' for Senate)")
+    candidates: List[ElectionCandidateResponse] = Field(default_factory=list, description="Contenders in this race")
+
+    class Config:
+        from_attributes = True
+
+class StateElectionsPayload(BaseModel):
+    state_code: str = Field(..., example="WA", description="Two-letter state postal code")
+    election_cycle: int = Field(..., example=2026, description="Election cycle year")
+    total_races: int = Field(..., description="Total active contest slates in the state")
+    races: List[ElectionSlateResponse] = Field(default_factory=list, description="List of grouped race slates")
+
+    class Config:
+        from_attributes = True
 
 # Pydantic schema matching the payload sent by PoliticianActionButtons.jsx
 class ClickEvent(BaseModel):
@@ -1493,82 +1505,95 @@ def get_politician_vote_stats(politician_id: str) -> Dict[str, Any]:
 # -------------------------------------------------------------------
 # Election Endpoints
 # -------------------------------------------------------------------
-@app.get("/state", response_model=StateElectionResponse)
+@app.get("/api/elections/state", response_model=StateElectionsPayload, summary="Get state election slates and candidates")
 def get_state_elections(
         state_code: str = Query(..., max_length=2, description="Two-letter state code, e.g. WA"),
-        cycle: int = Query(2026, description="Election cycle year")
+        cycle: Optional[int] = Query(2026, description="Election cycle year")
 ):
-    """
-    Fetches active election contenders and results for a given state.
-    Leverages Redis caching for instant state-switching.
-    """
     state_clean = state_code.upper().strip()
     cache_key = f"elections:{cycle}:{state_clean}"
 
-    # 1. Try reading from Redis cache
-    cached_payload = cache.get(cache_key)
-    if cached_payload:
-        return cached_payload
-
-    # 2. Query DuckDB for Candidates & Results
+    # 1. Read Path: Check Redis Cache First
     try:
-        conn = duckdb.connect(DUCKDB_PATH, read_only=True)
+        cached_payload = cache.get(cache_key)
+        if cached_payload:
+            if isinstance(cached_payload, (bytes, bytearray)):
+                cached_payload = cached_payload.decode("utf-8")
+            data = json.loads(cached_payload) if isinstance(cached_payload, str) else cached_payload
+            return StateElectionsPayload(**data)
+    except Exception as err:
+        logger.warning(f"Redis read error for election cache key {cache_key}: {err}")
 
+    # 2. Database Query (Cache Miss)
+    try:
+        conn = get_db_cursor()
         query = """
                 SELECT
+                    e.election_id,
+                    e.office_sought,
+                    e.district,
                     p.id AS politician_id,
                     p.name,
                     p.party,
-                    p.office,
-                    p.district,
-                    COALESCE(p.total_receipts, 0.0) AS total_receipts,
-                    COALESCE(r.votes_received, 0) AS votes_received,
-                    COALESCE(r.vote_share_pct, 0.0) AS vote_share_pct,
-                    COALESCE(r.is_winner, FALSE) AS is_winner,
-                    COALESCE(p.is_incumbent, FALSE) AS is_incumbent
-                FROM main_dbt.dim_politicians p
-                         LEFT JOIN main_dbt.fct_election_results r
-                                   ON p.id = r.politician_id
-                                       AND r.election_cycle = ?
-                WHERE p.state = ?
-                ORDER BY p.office DESC, p.district ASC, total_receipts DESC; \
+                    p.campaign,
+                    rc.is_incumbent,
+                    COALESCE(p.total_receipts, 0.0) AS total_receipts
+                FROM main.fct_elections e
+                         JOIN main.fct_race_candidates rc ON e.election_id = rc.election_id
+                         JOIN main.dim_politicians p ON rc.politician_id = p.id
+                WHERE e.state_code = ? AND e.election_cycle = ?
+                ORDER BY e.office_sought DESC, e.district ASC, total_receipts DESC;
                 """
-
-        rows = conn.execute(query, [cycle, state_clean]).fetchall()
+        rows = conn.execute(query, [state_clean, cycle]).fetchall()
         conn.close()
 
-        candidates = [
-            CandidateResult(
-                politician_id=row[0],
-                name=row[1],
-                party=row[2],
-                office=row[3],
-                district=row[4],
-                total_receipts=row[5],
-                votes_received=row[6],
-                vote_share_pct=row[7],
-                is_winner=row[8],
-                is_incumbent=row[9]
+        races_map = {}
+        for r in rows:
+            election_id = r[0]
+            if election_id not in races_map:
+                races_map[election_id] = {
+                    "election_id": election_id,
+                    "office": r[1],
+                    "district": r[2],
+                    "candidates": []
+                }
+
+            races_map[election_id]["candidates"].append(
+                ElectionCandidateResponse(
+                    politician_id=r[3],
+                    name=r[4],
+                    party=r[5],
+                    campaign_url=r[6],
+                    is_incumbent=r[7],
+                    total_receipts=r[8]
+                )
             )
-            for row in rows
-        ]
 
-        payload = {
-            "state_code": state_clean,
-            "election_cycle": cycle,
-            "total_races": len(candidates),
-            "candidates": candidates
-        }
+        races_list = [ElectionSlateResponse(**data) for data in races_map.values()]
 
-        # 3. Cache in Redis for 1 hour (3600s)
-        cache.set(cache_key, payload, ex_seconds=3600)
+        payload = StateElectionsPayload(
+            state_code=state_clean,
+            election_cycle=cycle,
+            total_races=len(races_list),
+            races=races_list
+        )
+
+        # 3. Write Path: Cache result in Redis (TTL: 1 Hour)
+        try:
+            cache.set(
+                cache_key,
+                json.dumps(payload.model_dump()),
+                ex_seconds=CACHE_TTL_ELECTIONS
+            )
+        except Exception as err:
+            logger.warning(f"Redis write error for election cache key {cache_key}: {err}")
+
         return payload
 
     except Exception as e:
-        logger.error(f"Error fetching election data for {state_clean}: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to load election data for {state_clean}"
+            detail=f"Failed to retrieve elections for {state_clean}: {str(e)}"
         )
 def invalidate_user_cache(user_id: str):
     """Purges cached user summary keys from Redis."""
