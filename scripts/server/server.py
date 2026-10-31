@@ -356,7 +356,7 @@ def get_authenticated_user_id(authorization: str = Header(...)) -> str:
     token = authorization.split(" ", 1)[1].strip()
 
     try:
-        user_res = supabase_admin.auth.get_user(token)
+        user_res = supabase.auth.get_user(token)
         if not user_res or not user_res.user:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token.")
         return user_res.user.id
@@ -487,7 +487,7 @@ def get_user_summary(current_user: str = Depends(get_current_user)):
                 if session.get("status") == "verified":
                     is_verified = True
                     # Sync updated state back to Supabase
-                    supabase_admin.table("profiles").update(
+                    supabase.table("profiles").update(
                         {"is_identity_verified": True}
                     ).eq("id", user_id).execute()
             except stripe.error.StripeError as stripe_err:
@@ -1291,7 +1291,7 @@ def get_user_summary(current_user: str = Depends(get_current_user)):
                 if session.get("status") == "verified":
                     is_verified = True
                     # Sync updated state back to Supabase
-                    supabase_admin.table("profiles").update(
+                    supabase.table("profiles").update(
                         {"is_identity_verified": True}
                     ).eq("id", user_id).execute()
             except stripe.error.StripeError as stripe_err:
