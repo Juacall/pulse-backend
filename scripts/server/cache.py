@@ -1,7 +1,7 @@
 import logging
 import json
 import os
-from typing import Any, Optional
+from typing import Any, Optional, Union, List
 import httpx
 from upstash_redis import Redis
 
@@ -54,5 +54,33 @@ class SafeRedisCache:
             logger.warning(f"Redis WRITE error for key '{key}': {e}. Continuing without caching.")
             return False
 
+    def delete(self, *keys: Union[str, List[str]]) -> int:
+        """
+        Safely invalidates one or more keys in Upstash Redis.
+        Accepts individual key strings or a list of key strings.
+        Returns the number of keys deleted (or 0 on failure).
+        """
+        if not self.client or not keys:
+            return 0
+
+        try:
+            # Flatten keys if passed as a single list or tuple
+            flat_keys = []
+            for k in keys:
+                if isinstance(k, (list, tuple)):
+                    flat_keys.extend(k)
+                elif k:
+                    flat_keys.append(str(k))
+
+            if not flat_keys:
+                return 0
+
+            # Upstash Redis SDK accepts *flat_keys positional arguments
+            deleted_count = self.client.delete(*flat_keys)
+            logger.info(f"Successfully invalidated Redis keys: {flat_keys}")
+            return deleted_count or 0
+        except Exception as err:
+            logger.warning(f"Redis DELETE error for keys={keys}: {err}. Continuing without cache eviction.")
+            return 0
 # Export a single global instance
 cache = SafeRedisCache()
