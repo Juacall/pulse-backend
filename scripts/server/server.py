@@ -6,11 +6,11 @@ import re
 import threading
 import time
 import duckdb
-import requests
+import json
 import stripe
 import httpx
 from datetime import datetime, timezone
-from fastapi import FastAPI,APIRouter,Query, Depends, HTTPException, Header, Request, status,BackgroundTasks
+from fastapi import FastAPI, Query, Depends, HTTPException, Header, Request, status, BackgroundTasks
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -27,7 +27,6 @@ from scripts.rag.payload import sanitize_content_field, sanitize_payload
 from scripts.rag.database import connect_duckdb, database_label
 from scripts.rag.router import PreProcessingRouter, QueryAnalysis
 from scripts.server.rate_limiter import RateLimiter
-router = APIRouter()
 
 app = FastAPI(title="Pulse API", version="1.0.0")
 logger = logging.getLogger("uvicorn.error")
@@ -36,6 +35,7 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SECRET_KEY") # Service role for backend DB updates
 TURNSTILE_SECRET_KEY = os.getenv("TURNSTILE_SECRET_KEY")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
+CACHE_TTL_USER_VOTES = 86400
 
 supabase: Optional[Client] = (
     create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -51,6 +51,7 @@ _duckdb_lock = threading.Lock()
 standard_limiter = RateLimiter(requests_per_minute=120, burst_limit=30)
 search_limiter = RateLimiter(requests_per_minute=30, burst_limit=10)
 ai_console_limiter = RateLimiter(requests_per_minute=5, burst_limit=2)
+
 
 def get_db_cursor() -> duckdb.DuckDBPyConnection:
     """Return a per-request cursor on the worker's shared read-only DuckDB connection."""
@@ -109,6 +110,15 @@ class ClickEvent(BaseModel):
     button_type: str
     destination_url: str
     timestamp: Optional[str] = None
+
+class UserSummaryResponse(BaseModel):
+    user_id: str
+    is_identity_verified: bool  # 👈 Fixed: bool instead of str
+    stripe_verification_id: Optional[str] = None  # 👈 Fixed: Optional[str] allows None
+    votes_map: Dict[str, str]  # 👈 Fixed: Dict[str, str] for politician_id -> vote_type map
+
+    class Config:
+        from_attributes = True
 
 # Enable CORS for Vite dev server (and production domains)
 app.add_middleware(
@@ -302,7 +312,7 @@ def get_current_user(authorization: str = Header(...)):
     # 2. Check profile verification state in PostgreSQL
     try:
         profile = supabase.table("profiles").select("*").eq("id", user_id).single().execute()
-        if not profile.data or not profile.data.get("is_identity_verified"):
+        if not profile.data:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Identity verification required to vote.")
     except HTTPException:
         raise
@@ -313,6 +323,30 @@ def get_current_user(authorization: str = Header(...)):
         ) from e
 
     return user_id
+
+def get_authenticated_user_id(authorization: str = Header(...)) -> str:
+    """
+    Lightweight auth dependency: Validates token with Supabase
+    WITHOUT throwing HTTP 403 if the user is unverified.
+    """
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid auth header format. Expected 'Bearer <token>'."
+        )
+
+    token = authorization.split(" ", 1)[1].strip()
+
+    try:
+        user_res = supabase_admin.auth.get_user(token)
+        if not user_res or not user_res.user:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token.")
+        return user_res.user.id
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"Authentication error: {str(e)}"
+        )
 
 # -------------------------------------------------------------------
 # HEALTH CHECK ENDPOINTS
@@ -378,54 +412,67 @@ def track_click(
 # -------------------------------------------------------------------
 # AUTH ENDPOINTS
 # -------------------------------------------------------------------
-@app.post("/api/auth/register", status_code=status.HTTP_201_CREATED)
-def register_user(payload: RegisterRequest):
-    try:
-        # Registers user with Supabase Auth
-        res = supabase.auth.sign_up({
-            "email": payload.email,
-            "password": payload.password
-        })
 
-        if not res.user:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Registration failed.")
+@app.get("/status")
+async def check_verification_status(user_id: str = Depends(get_authenticated_user_id)):
+    """
+    Queries Supabase for 'stripe_verification_id', verifies session state
+    with Stripe, and performs self-healing sync on 'is_identity_verified'.
+    """
+    try:
+        # 1. Fetch profile from Supabase
+        profile_res = (
+            supabase_admin.table("profiles")
+            .select("is_identity_verified, stripe_verification_id")
+            .eq("id", user_id)
+            .single()
+            .execute()
+        )
+
+        profile = profile_res.data
+        if not profile:
+            raise HTTPException(status_code=404, detail="User profile not found.")
+
+        verification_id = profile.get("stripe_verification_id")
+
+        # 2. Return unverified if no session ID exists yet
+        if not verification_id:
+            return {
+                "is_verified": False,
+                "status": "unverified",
+                "verification_id": None,
+                "message": "No verification session has been started."
+            }
+
+        # 3. Retrieve live VerificationSession status from Stripe
+        session = stripe.identity.VerificationSession.retrieve(verification_id)
+        session_status = session.get("status")  # verified, requires_input, processing, canceled
+        is_verified = (session_status == "verified")
+
+        # 4. Self-healing sync: update Supabase if the DB flag is behind Stripe's status
+        if is_verified != profile.get("is_identity_verified"):
+            supabase_admin.table("profiles").update(
+                {"is_identity_verified": is_verified}
+            ).eq("id", user_id).execute()
 
         return {
-            "message": "User registered successfully",
-            "userId": res.user.id,
-            "email": res.user.email
+            "is_verified": is_verified,
+            "status": session_status,
+            "verification_id": verification_id,
+            "last_error": session.get("last_error")
         }
-    except Exception as e:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
-@app.post("/api/auth/login", response_model=LoginResponse)
-def login(payload: LoginRequest):
-    try:
-        # Authenticate credentials against Supabase Auth
-        res = supabase.auth.sign_in_with_password({
-            "email": payload.email,
-            "password": payload.password
-        })
-
-        if not res.session or not res.user:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid email or password"
-            )
-
-        return LoginResponse(
-            access_token=res.session.access_token,
-            refresh_token=res.session.refresh_token,
-            user_id=res.user.id,
-            email=res.user.email
-        )
-
-    except Exception as e:
-        # Pass through specific authentication errors from Supabase
+    except stripe.error.StripeError as e:
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid login credentials"
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Stripe API error: {str(e)}"
         )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Server error: {str(e)}"
+        )
+
 
 @app.post("/api/identity/create-session")
 async def create_verification_session(user: dict = Depends(verify_authenticated_user)):
@@ -448,11 +495,11 @@ async def create_verification_session(user: dict = Depends(verify_authenticated_
         options={
             "document": {
                 "require_matching_selfie": True,
-                "require_address": True,
             }
         },
         return_url=return_url
     )
+
     return {"client_secret": session.client_secret, "url": session.url}
 
 
@@ -481,38 +528,44 @@ async def stripe_webhook(request: Request):
 
     if event["type"] == "identity.verification_session.verified":
         session = event["data"]["object"]
-        args = session.to_dict()
-        supabase_user_id = args.get("client_reference_id") # 👈 Retreive original Supabase UUID
-
+        session_id = session['id']
+        user_id = session['client_reference_id']
+        if user_id:
+            report_id = session['last_verification_report']
+            report = stripe.identity.VerificationReport.retrieve(report_id)
+            doc_data = report.to_dict()
         # Fetch verified address details from Stripe Identity redacts
-        verified_outputs = args.get("verified_outputs", {})
-        address = verified_outputs.get("address", {})
-        print(address)
-        city = address.get("city")
-        state = address.get("state")
-        country = address.get("country")
-        current_timestamp = datetime.now(timezone.utc).isoformat()
+            verified_outputs = doc_data.get("document", {})
+            address = verified_outputs.get("address", {})
+            city = address.get("city")
+            state = address.get("state")
+            country = address.get("country")
+            postal_code = address.get("postal_code")
+            current_timestamp = datetime.now(timezone.utc).isoformat()
 
-        # Update public.profiles in Supabase
-        supabase.table("profiles").update({
-            "state_code": state,
-            "country_code": country,
-            "verified_at": current_timestamp,
-            "is_identity_verified": True,
-            "stripe_verification_id": args["id"]
-        }).eq("id", supabase_user_id).execute()
+            # Update public.profiles in Supabase
+            supabase.table("profiles").update({
+                "state_code": state,
+                "country_code": country,
+                "postal_code" : postal_code,
+                "city" : city,
+                "verified_at": current_timestamp,
+                "is_identity_verified": True,
+                "stripe_verification_id": session_id
+            }).eq("id", user_id).execute()
 
-        #Update Supabase Auth user_metadata (syncs session in frontend)
-        supabase.auth.admin.update_user_by_id(
-            supabase_user_id,
-            {
-                "user_metadata": {
-                    "is_identity_verified": True,
-                    "state_code": state,
-                    "city": city
+            #Update Supabase Auth user_metadata (syncs session in frontend)
+            supabase.auth.admin.update_user_by_id(
+                user_id,
+                {
+                    "user_metadata": {
+                        "is_identity_verified": True,
+                        "state_code": state,
+                        "city": city
+                    }
                 }
-            }
-        )
+            )
+            invalidate_user_cache(user_id)
 
     return {"status": "success"}
 
@@ -578,7 +631,6 @@ async def verify_turnstile_token(token: str, client_ip:str):
 # -------------------------------------------------------------------
 # POLITICIANS & DELEGATION DIRECTORY ENDPOINTS
 # -------------------------------------------------------------------
-import json
 
 def fetch_vote_aggregates_from_supabase() -> Dict[str, Dict[str, int]]:
     """
@@ -1130,6 +1182,98 @@ def chat_with_agent(request: ChatRequest):
 # -------------------------------------------------------------------
 # Vote Endpoints
 # -------------------------------------------------------------------
+@app.get("/api/votes/usersummary",response_model=UserSummaryResponse)
+def get_user_summary(current_user: str = Depends(get_current_user)):
+    """
+    Returns user profile, Stripe verification status, and a mapping of
+    politician_id -> vote_type for the authenticated user.
+    Leverages Redis caching for fast state hydration on app load.
+    """
+    user_id = current_user
+    if not user_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User identity could not be verified."
+        )
+    cache_key = f"user:{user_id}:summary"
+
+    # 1. Check Redis Cache First
+    try:
+        cached_data = cache.get(cache_key)
+        if cached_data:
+            if isinstance(cached_data, (bytes, bytearray)):
+                cached_data = cached_data.decode("utf-8")
+            return json.loads(cached_data) if isinstance(cached_data, str) else cached_data
+    except Exception as err:
+        logger.warning(f"Redis read error for user summary (user_id={user_id}): {err}")
+
+    # 2. Query Supabase (Profile Verification & User Votes)
+    try:
+        # Fetch profile verification data
+        profile_res = (
+            supabase.table("profiles")
+            .select("is_identity_verified, stripe_verification_id")
+            .eq("id", user_id)
+            .single()
+            .execute()
+        )
+
+        # Fetch voting history
+        votes_res = (
+            supabase.table("user_votes")
+            .select("politician_id, vote_type")
+            .eq("user_id", user_id)
+            .execute()
+        )
+        profile_data = profile_res.data or {}
+        raw_votes = votes_res.data or []
+
+        is_verified = profile_data.get("is_identity_verified", False)
+        stripe_verification_id = profile_data.get("stripe_verification_id")
+
+        # 3. Stripe Self-Healing Check
+        # If DB status is False but a Stripe session exists, verify status directly with Stripe
+        if stripe_verification_id and not is_verified:
+            try:
+                session = stripe.identity.VerificationSession.retrieve(stripe_verification_id)
+                if session.get("status") == "verified":
+                    is_verified = True
+                    # Sync updated state back to Supabase
+                    supabase_admin.table("profiles").update(
+                        {"is_identity_verified": True}
+                    ).eq("id", user_id).execute()
+            except stripe.error.StripeError as stripe_err:
+                logger.error(f"Failed to check Stripe verification status for session {stripe_verification_id}: {stripe_err}")
+
+        # Construct vote map: { "politician_id_123": "YEA", "politician_id_456": "NAY" }
+        vote_map = {row["politician_id"]: row["vote_type"] for row in raw_votes}
+
+        # Build payload
+        summary_payload = {
+            "user_id": user_id,
+            "is_identity_verified": is_verified,
+            "stripe_verification_id": stripe_verification_id,
+            "votes_map": vote_map
+        }
+
+        # 4. Write back to Redis Cache
+        try:
+            cache.set(
+                cache_key,
+                json.dumps(summary_payload),
+                ex_seconds=CACHE_TTL_USER_VOTES
+            )
+        except Exception as err:
+            logger.warning(f"Redis write error for user summary (user_id={user_id}): {err}")
+
+        return summary_payload
+
+    except Exception as e:
+        logger.error(f"Failed to fetch user summary for user_id={user_id}: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to retrieve user voting and verification records: {str(e)}"
+        )
 
 @app.get("/api/politicians/{politician_id}/roll-call-votes")
 def get_official_roll_call_votes(politician_id: str):
@@ -1198,20 +1342,36 @@ def submit_vote(
             on_conflict="user_id, politician_id"
         ).execute()
 
-        # 2. Invalidate old Redis cache key
-        cache_key = f"sentiment:{request.politician_id}"
+        # 2. Invalidate public politician sentiment cache
+        politician_cache_key = f"sentiment:{request.politician_id}"
         try:
-            cache.delete(cache_key)
+            cache.delete(politician_cache_key)
         except Exception as cache_err:
-            logger.warning(f"Failed to delete Redis cache key {cache_key}: {cache_err}")
+            logger.warning(f"Failed to delete public sentiment cache key {politician_cache_key}: {cache_err}")
 
-        # 3. Calculate fresh database tallies
+        # 3. Update active user's personal vote summary in Redis
+        user_summary_cache_key = f"user:{user_id}:votes_summary"
+        try:
+            cached_user_votes = cache.get(user_summary_cache_key)
+            if cached_user_votes:
+                vote_map = json.loads(cached_user_votes) if isinstance(cached_user_votes, (str, bytes)) else cached_user_votes
+                vote_map[request.politician_id] = request.vote_type
+                cache.set(user_summary_cache_key, json.dumps(vote_map), ex=86400)
+            else:
+                cache.delete(user_summary_cache_key)
+        except Exception as user_cache_err:
+            logger.warning(f"Failed to update user votes summary cache key {user_summary_cache_key}: {user_cache_err}")
+
+        # 4. Calculate fresh database tallies
         fresh_stats = fetch_sentiment_from_supabase(request.politician_id)
 
-        # 4. Write fresh counts back to Redis cache (30s TTL)
-        cache.set(cache_key, fresh_stats, ex_seconds=30)
+        # 5. Write fresh politician counts back to Redis cache
+        try:
+            cache.set(politician_cache_key, fresh_stats, ex_seconds=30)
+        except Exception as cache_err:
+            logger.warning(f"Failed to write fresh stats to Redis: {cache_err}")
 
-        # 5. Return updated tallies directly to the client
+        # 6. Return updated tallies and user stance directly to client
         return {
             "status": "success",
             "message": "Vote recorded successfully.",
@@ -1225,7 +1385,6 @@ def submit_vote(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Database error: {str(e)}"
         )
-
 def fetch_sentiment_from_supabase(politician_id: str) -> Dict[str, int]:
     """Fallback query aggregating vote tallies efficiently."""
     try:
@@ -1280,6 +1439,17 @@ def get_politician_vote_stats(politician_id: str) -> Dict[str, Any]:
         "source": "database"
     }
 
+def invalidate_user_cache(user_id: str):
+    """Purges cached user summary keys from Redis."""
+    try:
+        # Match keys constructed in get_user_summary
+        keys_to_delete = [
+            f"user:{user_id}:summary",
+        ]
+        cache.delete(*keys_to_delete)
+        logger.info(f"Successfully invalidated Redis cache for user_id={user_id}")
+    except Exception as err:
+        logger.warning(f"Failed to invalidate Redis cache for user_id={user_id}: {err}")
 
 
 if __name__ == "__main__":
