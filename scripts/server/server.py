@@ -150,6 +150,68 @@ class UserSummaryResponse(BaseModel):
     class Config:
         from_attributes = True
 
+class NationalDonationSummary(BaseModel):
+    total_grassroots_dollars: float
+    total_large_donor_dollars: float
+    total_pac_dollars: float
+    total_receipts_dollars: float
+    national_grassroots_pct: float
+
+class StateDonationSummary(BaseModel):
+    state: str
+    candidate_count: int
+    total_grassroots_dollars: float
+    total_large_donor_dollars: float
+    total_pac_dollars: float
+    total_receipts_dollars: float
+    grassroots_pct: float
+
+class IncumbentVsChallengerMetrics(BaseModel):
+    category: str
+    candidate_count: int
+    total_grassroots_dollars: float
+    total_large_donor_dollars: float
+    total_pac_dollars: float
+    total_receipts_dollars: float
+    avg_grassroots_pct: float
+
+class TopDonorItem(BaseModel):
+    donor_rank: int
+    donor_name: str
+    industry: str
+    cycle: str
+    total_amount: float
+
+class CandidateDistrictFinancials(BaseModel):
+    politician_id: str
+    politician_name: str
+    party: Optional[str]
+    is_incumbent: bool
+    total_receipts: float
+    grassroots_contributions: float
+    large_donor_contributions: float
+    pac_contributions: float
+    grassroots_percentage: float
+    coverage_end_date: Optional[str]
+
+class DistrictRaceSummaryResponse(BaseModel):
+    state: str
+    district: str
+    total_race_receipts: float
+    candidate_count: int
+    candidates: List[CandidateDistrictFinancials]
+
+class StateIncumbentSplitMetrics(BaseModel):
+    state: str
+    category: str
+    candidate_count: int
+    total_grassroots_dollars: float
+    total_large_donor_dollars: float
+    total_pac_dollars: float
+    total_receipts_dollars: float
+    grassroots_pct: float
+
+
 # Enable CORS for Vite dev server (and production domains)
 app.add_middleware(
     CORSMiddleware,
@@ -628,7 +690,7 @@ async def stripe_webhook(request: Request):
                     }
                 }
             )
-            invalidate_user_cache(user_id)
+            cache.invalidate_user_cache(user_id)
 
     return {"status": "success"}
 
@@ -1537,12 +1599,15 @@ def get_state_elections(
                     p.party,
                     p.campaign,
                     rc.is_incumbent,
+                    rc.is_winner,
+                    rc.votes_count,
+                    rc.vote_percentage,
                     COALESCE(p.total_receipts, 0.0) AS total_receipts
                 FROM main.fct_elections e
                          JOIN main.fct_race_candidates rc ON e.election_id = rc.election_id
                          JOIN main.dim_politicians p ON rc.politician_id = p.id
                 WHERE e.state_code = ? AND e.election_cycle = ?
-                ORDER BY e.office_sought DESC, e.district ASC, total_receipts DESC;
+                ORDER BY e.office_sought DESC, e.district ASC, rc.is_winner DESC, votes_count DESC;
                 """
         rows = conn.execute(query, [state_clean, cycle]).fetchall()
         conn.close()
@@ -1595,19 +1660,333 @@ def get_state_elections(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to retrieve elections for {state_clean}: {str(e)}"
         )
-def invalidate_user_cache(user_id: str):
-    """Purges cached user summary keys from Redis."""
+
+# -------------------------------------------------------------------
+# Analytics Endpoints
+# -------------------------------------------------------------------
+@app.get(
+    "/api/analytics/donations/national-summary",
+    response_model=NationalDonationSummary,
+    summary="Get Macro National Campaign Finance Summary"
+)
+def get_national_donation_summary():
+    conn = None
     try:
-        # Match keys constructed in get_user_summary
-        keys_to_delete = [
-            f"user:{user_id}:summary",
+        conn = get_db_cursor()
+        query = """
+                SELECT
+                    ROUND(COALESCE(SUM(s.individual_unitemized), 0.0), 2) AS total_grassroots_dollars,
+                    ROUND(COALESCE(SUM(s.individual_itemized), 0.0), 2) AS total_large_donor_dollars,
+                    ROUND(COALESCE(SUM(s.pac_contributions), 0.0), 2) AS total_pac_dollars,
+                    ROUND(COALESCE(SUM(s.total_receipts), 0.0), 2) AS total_receipts_dollars,
+                    ROUND(
+                            COALESCE(
+                                    (SUM(s.individual_unitemized) / NULLIF(SUM(s.total_receipts), 0.0)) * 100,
+                                    0.0
+                            ), 2
+                    ) AS national_grassroots_pct
+                FROM main.politician_fec_summary s; \
+                """
+        row = conn.execute(query).fetchone()
+
+        if not row or row[0] is None:
+            return {
+                "total_grassroots_dollars": 0.0,
+                "total_large_donor_dollars": 0.0,
+                "total_pac_dollars": 0.0,
+                "total_receipts_dollars": 0.0,
+                "national_grassroots_pct": 0.0
+            }
+
+        return {
+            "total_grassroots_dollars": float(row[0]),
+            "total_large_donor_dollars": float(row[1]),
+            "total_pac_dollars": float(row[2]),
+            "total_receipts_dollars": float(row[3]),
+            "national_grassroots_pct": float(row[4])
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to retrieve donation analytics: {str(e)}"
+        )
+    finally:
+        if conn:
+            conn.close()
+
+
+@app.get(
+    "/api/analytics/donations/by-state",
+    response_model=List[StateDonationSummary],
+    summary="Get Campaign Finance Summaries Aggregated by State"
+)
+def get_donations_by_state(
+        min_receipts: Optional[float] = Query(0.0, description="Filter out states with total receipts below this threshold"),
+        limit: Optional[int] = Query(50, ge=1, le=50, description="Limit the number of states returned")
+):
+    conn = None
+    try:
+        conn = get_db_cursor()
+        query = """
+                SELECT
+                    p.state,
+                    COUNT(DISTINCT s.politician_id) AS candidate_count,
+                    ROUND(COALESCE(SUM(s.individual_unitemized), 0.0), 2) AS total_grassroots_dollars,
+                    ROUND(COALESCE(SUM(s.individual_itemized), 0.0), 2) AS total_large_donor_dollars,
+                    ROUND(COALESCE(SUM(s.pac_contributions), 0.0), 2) AS total_pac_dollars,
+                    ROUND(COALESCE(SUM(s.total_receipts), 0.0), 2) AS total_receipts_dollars,
+                    ROUND(
+                            COALESCE(
+                                    (SUM(s.individual_unitemized) / NULLIF(SUM(s.total_receipts), 0.0)) * 100,
+                                    0.0
+                            ), 2
+                    ) AS grassroots_pct
+                FROM main.politician_fec_summary s
+                         JOIN main.dim_politicians p ON s.politician_id = p.id
+                WHERE p.state IS NOT NULL AND p.state != ''
+                GROUP BY p.state
+                HAVING total_receipts_dollars >= ?
+                ORDER BY total_receipts_dollars DESC
+                    LIMIT ?; \
+                """
+        rows = conn.execute(query, [min_receipts, limit]).fetchall()
+
+        return [
+            StateDonationSummary(
+                state=row[0],
+                candidate_count=row[1],
+                total_grassroots_dollars=float(row[2]),
+                total_large_donor_dollars=float(row[3]),
+                total_pac_dollars=float(row[4]),
+                total_receipts_dollars=float(row[5]),
+                grassroots_pct=float(row[6])
+            )
+            for row in rows
         ]
-        cache.delete(*keys_to_delete)
-        logger.info(f"Successfully invalidated Redis cache for user_id={user_id}")
-    except Exception as err:
-        logger.warning(f"Failed to invalidate Redis cache for user_id={user_id}: {err}")
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to retrieve by-state donation analytics: {str(e)}"
+        )
+    finally:
+        if conn:
+            conn.close()
 
 
+@app.get(
+    "/api/analytics/donations/incumbent-vs-challenger",
+    response_model=List[IncumbentVsChallengerMetrics],
+    summary="Compare Financial Totals Between Incumbents and Challengers"
+)
+def get_incumbent_vs_challenger_donations():
+    conn = None
+    try:
+        conn = get_db_cursor()
+        query = """
+                SELECT
+                    CASE WHEN p.is_incumbent THEN 'Incumbents' ELSE 'Challengers' END AS category,
+                    COUNT(DISTINCT s.politician_id) AS candidate_count,
+                    ROUND(COALESCE(SUM(s.individual_unitemized), 0.0), 2) AS total_grassroots_dollars,
+                    ROUND(COALESCE(SUM(s.individual_itemized), 0.0), 2) AS total_large_donor_dollars,
+                    ROUND(COALESCE(SUM(s.pac_contributions), 0.0), 2) AS total_pac_dollars,
+                    ROUND(COALESCE(SUM(s.total_receipts), 0.0), 2) AS total_receipts_dollars,
+                    ROUND(
+                            COALESCE(
+                                    (SUM(s.individual_unitemized) / NULLIF(SUM(s.total_receipts), 0.0)) * 100,
+                                    0.0
+                            ), 2
+                    ) AS avg_grassroots_pct
+                FROM main.politician_fec_summary s
+                         JOIN main.dim_politicians p ON s.politician_id = p.id
+                GROUP BY p.is_incumbent
+                ORDER BY p.is_incumbent DESC; \
+                """
+        rows = conn.execute(query).fetchall()
+
+        return [
+            IncumbentVsChallengerMetrics(
+                category=row[0],
+                candidate_count=row[1],
+                total_grassroots_dollars=float(row[2]),
+                total_large_donor_dollars=float(row[3]),
+                total_pac_dollars=float(row[4]),
+                total_receipts_dollars=float(row[5]),
+                avg_grassroots_pct=float(row[6])
+            )
+            for row in rows
+        ]
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to retrieve incumbent vs challenger analytics: {str(e)}"
+        )
+    finally:
+        if conn:
+            conn.close()
+
+
+@app.get(
+    "/api/analytics/donations/top-donors/{politician_id}",
+    response_model=List[TopDonorItem],
+    summary="Get Top Individual Donors for a Specific Politician"
+)
+def get_politician_top_donors(politician_id: str, limit: int = Query(10, ge=1, le=20)):
+    conn = None
+    try:
+        conn = get_db_cursor()
+        query = """
+                SELECT
+                    ROW_NUMBER() OVER (ORDER BY amount DESC) AS donor_rank,
+                    donor_name,
+                    COALESCE(industry, 'N/A') AS industry,
+                    COALESCE(cycle, '2026') AS cycle,
+                    ROUND(amount, 2) AS total_amount
+                FROM main.politician_top_donors
+                WHERE politician_id = ?
+                ORDER BY amount DESC
+                    LIMIT ?; \
+                """
+        rows = conn.execute(query, [politician_id, limit]).fetchall()
+
+        return [
+            TopDonorItem(
+                donor_rank=row[0],
+                donor_name=row[1],
+                industry=row[2],
+                cycle=row[3],
+                total_amount=float(row[4])
+            )
+            for row in rows
+        ]
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to retrieve top donors for politician {politician_id}: {str(e)}"
+        )
+    finally:
+        if conn:
+            conn.close()
+
+
+@app.get(
+    "/api/analytics/donations/district",
+    response_model=DistrictRaceSummaryResponse,
+    summary="Get Detailed Financial Summary for Candidates in a Specific District"
+)
+def get_district_donation_summary(
+        state: str = Query(..., description="Two-letter state postal abbreviation"),
+        district: str = Query(..., description="Two-digit district code (e.g., '01')")
+):
+    conn = None
+    try:
+        conn = get_db_cursor()
+        query = """
+                SELECT
+                    p.id AS politician_id,
+                    p.name AS politician_name,
+                    p.party,
+                    p.is_incumbent,
+                    ROUND(COALESCE(s.total_receipts, 0.0), 2) AS total_receipts,
+                    ROUND(COALESCE(s.individual_unitemized, 0.0), 2) AS grassroots_contributions,
+                    ROUND(COALESCE(s.individual_itemized, 0.0), 2) AS large_donor_contributions,
+                    ROUND(COALESCE(s.pac_contributions, 0.0), 2) AS pac_contributions,
+                    ROUND(COALESCE(s.grassroots_percentage, 0.0), 2) AS grassroots_percentage,
+                    s.coverage_end_date
+                FROM main.dim_politicians p
+                         LEFT JOIN main.politician_fec_summary s ON p.id = s.politician_id
+                WHERE UPPER(p.state) = UPPER(?) AND p.district = ?
+                ORDER BY total_receipts DESC; \
+                """
+        rows = conn.execute(query, [state, district]).fetchall()
+
+        candidates = [
+            CandidateDistrictFinancials(
+                politician_id=row[0],
+                politician_name=row[1],
+                party=row[2],
+                is_incumbent=bool(row[3]),
+                total_receipts=float(row[4]),
+                grassroots_contributions=float(row[5]),
+                large_donor_contributions=float(row[6]),
+                pac_contributions=float(row[7]),
+                grassroots_percentage=float(row[8]),
+                coverage_end_date=row[9]
+            )
+            for row in rows
+        ]
+
+        total_race_receipts = sum(c.total_receipts for c in candidates)
+
+        return DistrictRaceSummaryResponse(
+            state=state.upper(),
+            district=district,
+            total_race_receipts=round(total_race_receipts, 2),
+            candidate_count=len(candidates),
+            candidates=candidates
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to retrieve district financials for {state}-{district}: {str(e)}"
+        )
+    finally:
+        if conn:
+            conn.close()
+
+
+@app.get(
+    "/api/analytics/donations/by-state/{state}/incumbent-vs-challenger",
+    response_model=List[StateIncumbentSplitMetrics],
+    summary="Get State Campaign Finance Metrics Broken Down by Incumbents vs. Challengers"
+)
+def get_state_incumbent_vs_challenger_donations(state: str):
+    conn = None
+    try:
+        conn = get_db_cursor()
+        query = """
+                SELECT
+                    UPPER(p.state) AS state,
+                    CASE WHEN p.is_incumbent THEN 'Incumbents' ELSE 'Challengers' END AS category,
+                    COUNT(DISTINCT s.politician_id) AS candidate_count,
+                    ROUND(COALESCE(SUM(s.individual_unitemized), 0.0), 2) AS total_grassroots_dollars,
+                    ROUND(COALESCE(SUM(s.individual_itemized), 0.0), 2) AS total_large_donor_dollars,
+                    ROUND(COALESCE(SUM(s.pac_contributions), 0.0), 2) AS total_pac_dollars,
+                    ROUND(COALESCE(SUM(s.total_receipts), 0.0), 2) AS total_receipts_dollars,
+                    ROUND(
+                            COALESCE(
+                                    (SUM(s.individual_unitemized) / NULLIF(SUM(s.total_receipts), 0.0)) * 100,
+                                    0.0
+                            ), 2
+                    ) AS grassroots_pct
+                FROM main.politician_fec_summary s
+                         JOIN main.dim_politicians p ON s.politician_id = p.id
+                WHERE UPPER(p.state) = UPPER(?)
+                GROUP BY p.state, p.is_incumbent
+                ORDER BY p.is_incumbent DESC; \
+                """
+        rows = conn.execute(query, [state]).fetchall()
+
+        return [
+            StateIncumbentSplitMetrics(
+                state=row[0],
+                category=row[1],
+                candidate_count=row[2],
+                total_grassroots_dollars=float(row[3]),
+                total_large_donor_dollars=float(row[4]),
+                total_pac_dollars=float(row[5]),
+                total_receipts_dollars=float(row[6]),
+                grassroots_pct=float(row[7])
+            )
+            for row in rows
+        ]
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to retrieve state incumbent comparison for {state}: {str(e)}"
+        )
+    finally:
+        if conn:
+            conn.close()
 
 if __name__ == "__main__":
     import uvicorn
