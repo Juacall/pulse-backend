@@ -223,7 +223,7 @@ app.add_middleware(
                    "https://www.legipulse.org",
                    "https://lettuce-verse-kindling.ngrok-free.dev",
                    "https://legipulse-backend.internal",
-                   "https://legipulse-frontend.internal"],
+                   "https://pulse-frontend.juacallb.workers.dev"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -2132,9 +2132,9 @@ def get_lawmaker_track_record(politician_id: str):
                            SELECT
                                total_sponsored_bills,
                                bipartisan_sponsored_bills,
-                               bipartisanship_score
+                               ROUND(bipartisanship_score, 1) AS bipartisanship_score
                            FROM main.mart_bipartisanship_score
-                           WHERE member_id = ?; \
+                           WHERE member_id = ?;
                            """
         b_row = conn.execute(bipartisan_query, [clean_id]).fetchone()
         bipartisanship_data = {
