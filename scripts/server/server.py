@@ -1601,15 +1601,12 @@ def get_state_elections(
                     p.party,
                     p.campaign,
                     rc.is_incumbent,
-                    rc.is_winner,
-                    rc.votes_count,
-                    rc.vote_percentage,
                     COALESCE(p.total_receipts, 0.0) AS total_receipts
                 FROM main.fct_elections e
                          JOIN main.fct_race_candidates rc ON e.election_id = rc.election_id
                          JOIN main.dim_politicians p ON rc.politician_id = p.id
                 WHERE e.state_code = ? AND e.election_cycle = ?
-                ORDER BY e.office_sought DESC, e.district ASC, rc.is_winner DESC, votes_count DESC;
+                ORDER BY e.office_sought DESC, e.district ASC;
                 """
         rows = conn.execute(query, [state_clean, cycle]).fetchall()
         conn.close()
@@ -2080,6 +2077,112 @@ def get_state_incumbent_vs_challenger_donations(state: str):
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to retrieve state incumbent comparison for {state}: {str(e)}"
+        )
+    finally:
+        if conn:
+            conn.close()
+
+# ------------------------------------------------------------------
+# 1. Legislative Track Record Endpoint
+# ------------------------------------------------------------------
+@app.get("/api/analytics/legislative/track-record/{politician_id}")
+def get_lawmaker_track_record(politician_id: str):
+    conn = None
+    clean_id = politician_id.upper()
+    cache_key = f"analytics:legislative:track-record:{clean_id}"
+
+    # Cache Read
+    try:
+        cached = cache.get(cache_key)
+        if cached:
+            return json.loads(cached if isinstance(cached, str) else cached.decode("utf-8"))
+    except Exception as err:
+        logger.warning(f"Redis read error for key {cache_key}: {err}")
+
+    try:
+        conn = get_db_cursor()
+
+        # A. Funnel Query
+        funnel_query = """
+                       SELECT
+                           member_relationship,
+                           total_bills,
+                           introduced_count,
+                           in_committee_count,
+                           passed_chamber_count,
+                           enacted_count
+                       FROM main.mart_bill_funnel
+                       WHERE member_id = ?; \
+                       """
+        funnel_rows = conn.execute(funnel_query, [clean_id]).fetchall()
+        funnel_data = [
+            {
+                "relationship": row[0],
+                "total_bills": row[1],
+                "introduced": row[2],
+                "in_committee": row[3],
+                "passed_chamber": row[4],
+                "enacted": row[5]
+            }
+            for row in funnel_rows
+        ]
+
+        # B. Bipartisanship Query
+        bipartisan_query = """
+                           SELECT
+                               total_sponsored_bills,
+                               bipartisan_sponsored_bills,
+                               bipartisanship_score
+                           FROM main.mart_bipartisanship_score
+                           WHERE member_id = ?; \
+                           """
+        b_row = conn.execute(bipartisan_query, [clean_id]).fetchone()
+        bipartisanship_data = {
+            "total_sponsored_bills": b_row[0] if b_row else 0,
+            "bipartisan_sponsored_bills": b_row[1] if b_row else 0,
+            "bipartisanship_score": float(b_row[2]) if b_row and b_row[2] is not None else 0.0
+        }
+
+        # C. Policy Focus Query
+        policy_query = """
+                       SELECT
+                           policy_area,
+                           bill_count,
+                           percentage_of_total
+                       FROM main.mart_policy_focus
+                       WHERE member_id = ?
+                       ORDER BY bill_count DESC
+                           LIMIT 10; \
+                       """
+        policy_rows = conn.execute(policy_query, [clean_id]).fetchall()
+        policy_data = [
+            {
+                "policy_area": row[0],
+                "bill_count": row[1],
+                "percentage": float(row[2])
+            }
+            for row in policy_rows
+        ]
+
+        payload = {
+            "politician_id": clean_id,
+            "funnel": funnel_data,
+            "bipartisanship": bipartisanship_data,
+            "policy_focus": policy_data
+        }
+
+        # Cache Write (24-Hour TTL)
+        try:
+            cache.set(cache_key, json.dumps(jsonable_encoder(payload)), ex_seconds=CACHE_TTL_24)
+        except Exception as err:
+            logger.warning(f"Redis write error for key {cache_key}: {err}")
+
+        return payload
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to fetch legislative track record for {politician_id}: {str(e)}"
         )
     finally:
         if conn:
