@@ -12,6 +12,7 @@ import httpx
 from datetime import datetime, timezone
 from fastapi import FastAPI, Query, Depends, HTTPException, Header, Request, status, BackgroundTasks
 from fastapi.responses import JSONResponse
+from fastapi.encoders import jsonable_encoder
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Any, Dict, List, Optional
@@ -37,6 +38,7 @@ TURNSTILE_SECRET_KEY = os.getenv("TURNSTILE_SECRET_KEY")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
 CACHE_TTL_USER_VOTES = 86400
 CACHE_TTL_ELECTIONS = 3600  # Cache duration: 1 hour (3600 seconds)
+CACHE_TTL_24 = 3600 * 24
 
 supabase: Optional[Client] = (
     create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -1671,6 +1673,20 @@ def get_state_elections(
 )
 def get_national_donation_summary():
     conn = None
+    cache_key = "analytics:donations:national"
+
+    # 1. Cache Read Path
+    try:
+        cached_payload = cache.get(cache_key)
+        if cached_payload:
+            if isinstance(cached_payload, (bytes, bytearray)):
+                cached_payload = cached_payload.decode("utf-8")
+            data = json.loads(cached_payload) if isinstance(cached_payload, str) else cached_payload
+            return NationalDonationSummary(**data)
+    except Exception as err:
+        logger.warning(f"Redis read error for national donation cache key {cache_key}: {err}")
+
+    # 2. Database Read Path
     try:
         conn = get_db_cursor()
         query = """
@@ -1690,21 +1706,34 @@ def get_national_donation_summary():
         row = conn.execute(query).fetchone()
 
         if not row or row[0] is None:
-            return {
-                "total_grassroots_dollars": 0.0,
-                "total_large_donor_dollars": 0.0,
-                "total_pac_dollars": 0.0,
-                "total_receipts_dollars": 0.0,
-                "national_grassroots_pct": 0.0
-            }
+            payload = NationalDonationSummary(
+                total_grassroots_dollars=0.0,
+                total_large_donor_dollars=0.0,
+                total_pac_dollars=0.0,
+                total_receipts_dollars=0.0,
+                national_grassroots_pct=0.0
+            )
+        else:
+            payload = NationalDonationSummary(
+                total_grassroots_dollars=float(row[0]),
+                total_large_donor_dollars=float(row[1]),
+                total_pac_dollars=float(row[2]),
+                total_receipts_dollars=float(row[3]),
+                national_grassroots_pct=float(row[4])
+            )
 
-        return {
-            "total_grassroots_dollars": float(row[0]),
-            "total_large_donor_dollars": float(row[1]),
-            "total_pac_dollars": float(row[2]),
-            "total_receipts_dollars": float(row[3]),
-            "national_grassroots_pct": float(row[4])
-        }
+        # 3. Cache Write Path
+        try:
+            cache.set(
+                cache_key,
+                json.dumps(payload.model_dump()),
+                ex_seconds=CACHE_TTL_24
+            )
+        except Exception as err:
+            logger.warning(f"Redis write error for national donation cache key {cache_key}: {err}")
+
+        return payload
+
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -1713,7 +1742,6 @@ def get_national_donation_summary():
     finally:
         if conn:
             conn.close()
-
 
 @app.get(
     "/api/analytics/donations/by-state",
@@ -1725,6 +1753,21 @@ def get_donations_by_state(
         limit: Optional[int] = Query(50, ge=1, le=50, description="Limit the number of states returned")
 ):
     conn = None
+    # 1. Parameterized Cache Key
+    cache_key = f'analytics:donations:by_state:min_{min_receipts}:limit_{limit}'
+
+    # 2. Cache Read Path
+    try:
+        cached_payload = cache.get(cache_key)
+        if cached_payload:
+            if isinstance(cached_payload, (bytes, bytearray)):
+                cached_payload = cached_payload.decode("utf-8")
+            data = json.loads(cached_payload) if isinstance(cached_payload, str) else cached_payload
+            return data
+    except Exception as err:
+        logger.warning(f"Redis read error for donations by state cache key {cache_key}: {err}")
+
+    # 3. Cache Miss Path
     try:
         conn = get_db_cursor()
         query = """
@@ -1751,7 +1794,7 @@ def get_donations_by_state(
                 """
         rows = conn.execute(query, [min_receipts, limit]).fetchall()
 
-        return [
+        payload = [
             StateDonationSummary(
                 state=row[0],
                 candidate_count=row[1],
@@ -1763,6 +1806,19 @@ def get_donations_by_state(
             )
             for row in rows
         ]
+
+        # 4. Cache Write Path
+        try:
+            cache.set(
+                cache_key,
+                json.dumps(jsonable_encoder(payload)),
+                ex_seconds=CACHE_TTL_24
+            )
+        except Exception as err:
+            logger.warning(f"Redis write error for donation by state cache key {cache_key}: {err}")
+
+        return payload
+
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -1780,6 +1836,20 @@ def get_donations_by_state(
 )
 def get_incumbent_vs_challenger_donations():
     conn = None
+    cache_key = "analytics:donations:incumbent-vs-challenger"
+
+    # 1. Cache Read Path (Upstash Redis)
+    try:
+        cached_payload = cache.get(cache_key)
+        if cached_payload:
+            if isinstance(cached_payload, (bytes, bytearray)):
+                cached_payload = cached_payload.decode("utf-8")
+            data = json.loads(cached_payload) if isinstance(cached_payload, str) else cached_payload
+            return [IncumbentVsChallengerMetrics(**item) for item in data]
+    except Exception as err:
+        logger.warning(f"Redis read error for key {cache_key}: {err}")
+
+    # 2. Database Fetch Path (DuckDB)
     try:
         conn = get_db_cursor()
         query = """
@@ -1803,7 +1873,7 @@ def get_incumbent_vs_challenger_donations():
                 """
         rows = conn.execute(query).fetchall()
 
-        return [
+        payload = [
             IncumbentVsChallengerMetrics(
                 category=row[0],
                 candidate_count=row[1],
@@ -1815,6 +1885,19 @@ def get_incumbent_vs_challenger_donations():
             )
             for row in rows
         ]
+
+        # 3. Cache Write Path (TTL: 24 Hours)
+        try:
+            cache.set(
+                cache_key,
+                json.dumps(jsonable_encoder(payload)),
+                ex_seconds=CACHE_TTL_24
+            )
+        except Exception as err:
+            logger.warning(f"Redis write error for key {cache_key}: {err}")
+
+        return payload
+
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -1824,48 +1907,6 @@ def get_incumbent_vs_challenger_donations():
         if conn:
             conn.close()
 
-
-@app.get(
-    "/api/analytics/donations/top-donors/{politician_id}",
-    response_model=List[TopDonorItem],
-    summary="Get Top Individual Donors for a Specific Politician"
-)
-def get_politician_top_donors(politician_id: str, limit: int = Query(10, ge=1, le=20)):
-    conn = None
-    try:
-        conn = get_db_cursor()
-        query = """
-                SELECT
-                    ROW_NUMBER() OVER (ORDER BY amount DESC) AS donor_rank,
-                    donor_name,
-                    COALESCE(industry, 'N/A') AS industry,
-                    COALESCE(cycle, '2026') AS cycle,
-                    ROUND(amount, 2) AS total_amount
-                FROM main.politician_top_donors
-                WHERE politician_id = ?
-                ORDER BY amount DESC
-                    LIMIT ?; \
-                """
-        rows = conn.execute(query, [politician_id, limit]).fetchall()
-
-        return [
-            TopDonorItem(
-                donor_rank=row[0],
-                donor_name=row[1],
-                industry=row[2],
-                cycle=row[3],
-                total_amount=float(row[4])
-            )
-            for row in rows
-        ]
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to retrieve top donors for politician {politician_id}: {str(e)}"
-        )
-    finally:
-        if conn:
-            conn.close()
 
 
 @app.get(
@@ -1878,6 +1919,21 @@ def get_district_donation_summary(
         district: str = Query(..., description="Two-digit district code (e.g., '01')")
 ):
     conn = None
+    clean_state = state.upper()
+    cache_key = f"analytics:donations:district:{clean_state}:{district}"
+
+    # 1. Upstash Redis Cache Read
+    try:
+        cached_payload = cache.get(cache_key)
+        if cached_payload:
+            if isinstance(cached_payload, (bytes, bytearray)):
+                cached_payload = cached_payload.decode("utf-8")
+            data = json.loads(cached_payload) if isinstance(cached_payload, str) else cached_payload
+            return DistrictRaceSummaryResponse(**data)
+    except Exception as err:
+        logger.warning(f"Redis read error for key {cache_key}: {err}")
+
+    # 2. Database Fetch Path
     try:
         conn = get_db_cursor()
         query = """
@@ -1897,7 +1953,7 @@ def get_district_donation_summary(
                 WHERE UPPER(p.state) = UPPER(?) AND p.district = ?
                 ORDER BY total_receipts DESC; \
                 """
-        rows = conn.execute(query, [state, district]).fetchall()
+        rows = conn.execute(query, [clean_state, district]).fetchall()
 
         candidates = [
             CandidateDistrictFinancials(
@@ -1917,13 +1973,26 @@ def get_district_donation_summary(
 
         total_race_receipts = sum(c.total_receipts for c in candidates)
 
-        return DistrictRaceSummaryResponse(
-            state=state.upper(),
+        response_payload = DistrictRaceSummaryResponse(
+            state=clean_state,
             district=district,
             total_race_receipts=round(total_race_receipts, 2),
             candidate_count=len(candidates),
             candidates=candidates
         )
+
+        # 3. Upstash Redis Cache Write (24-Hour TTL)
+        try:
+            cache.set(
+                cache_key,
+                json.dumps(jsonable_encoder(response_payload)),
+                ex_seconds=CACHE_TTL_24
+            )
+        except Exception as err:
+            logger.warning(f"Redis write error for key {cache_key}: {err}")
+
+        return response_payload
+
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -1941,6 +2010,21 @@ def get_district_donation_summary(
 )
 def get_state_incumbent_vs_challenger_donations(state: str):
     conn = None
+    clean_state = state.upper()
+    cache_key = f"analytics:donations:state-incumbent:{clean_state}"
+
+    # 1. Cache Read Path
+    try:
+        cached_payload = cache.get(cache_key)
+        if cached_payload:
+            if isinstance(cached_payload, (bytes, bytearray)):
+                cached_payload = cached_payload.decode("utf-8")
+            data = json.loads(cached_payload) if isinstance(cached_payload, str) else cached_payload
+            return [StateIncumbentSplitMetrics(**item) for item in data]
+    except Exception as err:
+        logger.warning(f"Redis read error for key {cache_key}: {err}")
+
+    # 2. Database Fetch Path
     try:
         conn = get_db_cursor()
         query = """
@@ -1964,9 +2048,9 @@ def get_state_incumbent_vs_challenger_donations(state: str):
                 GROUP BY p.state, p.is_incumbent
                 ORDER BY p.is_incumbent DESC; \
                 """
-        rows = conn.execute(query, [state]).fetchall()
+        rows = conn.execute(query, [clean_state]).fetchall()
 
-        return [
+        payload = [
             StateIncumbentSplitMetrics(
                 state=row[0],
                 category=row[1],
@@ -1979,6 +2063,19 @@ def get_state_incumbent_vs_challenger_donations(state: str):
             )
             for row in rows
         ]
+
+        # 3. Cache Write Path (TTL: 24 Hours)
+        try:
+            cache.set(
+                cache_key,
+                json.dumps(jsonable_encoder(payload)),
+                ex_seconds=CACHE_TTL_24
+            )
+        except Exception as err:
+            logger.warning(f"Redis write error for key {cache_key}: {err}")
+
+        return payload
+
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
