@@ -223,7 +223,7 @@ app.add_middleware(
                    "https://www.legipulse.org",
                    "https://lettuce-verse-kindling.ngrok-free.dev",
                    "https://legipulse-backend.internal",
-                   "https://legipulse-frontend.internal"],
+                   "https://pulse-frontend.juacallb.workers.dev"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
