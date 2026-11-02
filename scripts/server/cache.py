@@ -82,5 +82,18 @@ class SafeRedisCache:
         except Exception as err:
             logger.warning(f"Redis DELETE error for keys={keys}: {err}. Continuing without cache eviction.")
             return 0
+
+        def invalidate_user_cache(user_id: str):
+            """Purges cached user summary keys from Redis."""
+            try:
+                # Match keys constructed in get_user_summary
+                keys_to_delete = [
+                    f"user:{user_id}:summary",
+                ]
+                cache.delete(*keys_to_delete)
+                logger.info(f"Successfully invalidated Redis cache for user_id={user_id}")
+            except Exception as err:
+                logger.warning(f"Failed to invalidate Redis cache for user_id={user_id}: {err}")
+
 # Export a single global instance
 cache = SafeRedisCache()
