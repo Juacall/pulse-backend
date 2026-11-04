@@ -2095,15 +2095,25 @@ def strip_html(text: Optional[str]) -> Optional[str]:
     clean = re.sub(r'<[^>]*>', '', text)
     return clean.strip() or None
 
-def get_bills_watermark(conn: duckdb.DuckDBPyConnection, chamber: Optional[str]) -> str:
-    """Queries DuckDB metadata to get a 1ms watermark fingerprint for cache key invalidation."""
+def get_bills_watermark(
+        conn: duckdb.DuckDBPyConnection,
+        table_name: str = "main.mart_recent_bills",
+        chamber: Optional[str] = None
+) -> str:
+    """
+    Queries DuckDB metadata to get a 1ms watermark fingerprint for cache key invalidation.
+    Accepts any target table (e.g. main.mart_recent_bills or main.mart_recently_passed_bills).
+    """
     where_clause = "WHERE LOWER(chamber) = LOWER(?)" if chamber else ""
     params = [chamber] if chamber else []
 
+    # Dynamically select the max date column based on the target table
+    date_col = "bill_latest_action_date" if "passed" in table_name else "bill_introduced_date"
+
     query = f"""
         SELECT 
-            COALESCE(MAX(bill_introduced_date)::TEXT, '0') || '_' || COUNT(*)::TEXT
-        FROM main.mart_recent_bills
+            COALESCE(MAX({date_col})::TEXT, '0') || '_' || COUNT(*)::TEXT
+        FROM {table_name}
         {where_clause};
     """
     row = conn.execute(query, params).fetchone()
@@ -2126,8 +2136,7 @@ def get_recent_bills(
 
     try:
         # 1. Fetch 1ms metadata watermark fingerprint
-        watermark = get_bills_watermark(conn, chamber)
-
+        watermark = get_bills_watermark(conn, table_name="main.mart_recent_bills", chamber=chamber)
         # 2. Build Cache Key
         chamber_tag = chamber.lower() if chamber else "all"
         cache_key = f"legipulse:recent_bills:{chamber_tag}:limit_{per_chamber_limit}:wm_{watermark}"
@@ -2376,8 +2385,7 @@ def get_recently_passed_bills(
 
     try:
         # 1. Fetch 1ms watermark
-        watermark = get_passed_bills_watermark(conn, chamber)
-
+        watermark = get_bills_watermark(conn, table_name="main.mart_recently_passed_bills", chamber=chamber)
         # 2. Cache key
         chamber_tag = chamber.lower() if chamber else "all"
         cache_key = f"legipulse:passed_bills:{chamber_tag}:limit_{per_chamber_limit}:wm_{watermark}"
