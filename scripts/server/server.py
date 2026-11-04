@@ -2100,15 +2100,17 @@ def get_bills_watermark(
         table_name: str = "main.mart_recent_bills",
         chamber: Optional[str] = None
 ) -> str:
-    """
-    Queries DuckDB metadata to get a 1ms watermark fingerprint for cache key invalidation.
-    Accepts any target table (e.g. main.mart_recent_bills or main.mart_recently_passed_bills).
-    """
-    where_clause = "WHERE LOWER(chamber) = LOWER(?)" if chamber else ""
-    params = [chamber] if chamber else []
-
-    # Dynamically select the max date column based on the target table
+    """Queries DuckDB metadata for a 1ms watermark fingerprint for standard feed caching."""
     date_col = "bill_latest_action_date" if "passed" in table_name else "bill_introduced_date"
+
+    conditions = [f"{date_col} >= CURRENT_DATE - INTERVAL '365 days'"]
+    params = []
+
+    if chamber and chamber.lower() in ("house", "senate"):
+        conditions.append("LOWER(chamber) = LOWER(?)")
+        params.append(chamber)
+
+    where_clause = f"WHERE {' AND '.join(conditions)}"
 
     query = f"""
         SELECT 
@@ -2120,114 +2122,110 @@ def get_bills_watermark(
     raw_wm = row[0] if row else "0_0"
     return hashlib.md5(raw_wm.encode("utf-8")).hexdigest()[:12]
 
+
+# app/routers/bills.py or server.py
+
 @app.get("/api/bills/recent")
 def get_recent_bills(
         response: Response,
-        per_chamber_limit: int = Query(default=10, ge=1, le=30, description="Number of recent bills per chamber"),
+        q: Optional[str] = Query(default=None, description="Search by title, bill number, or sponsor within 1 year"),
+        page: int = Query(default=1, ge=1, description="Page number for pagination"),
+        per_chamber_limit: int = Query(default=10, ge=1, le=50, description="Number of recent bills per chamber per page"),
         chamber: Optional[str] = Query(default=None, description="Filter by chamber ('House' or 'Senate')")
 ):
     """
-    Retrieves recently introduced bills with CRS summaries, sponsor details,
-    and official Congress.gov links directly from main.mart_recent_bills.
-    Uses window partitioning (QUALIFY) to balance House and Senate representation,
-    and caches results via Upstash Redis using a dynamic database watermark.
+    Retrieves bills introduced within the past year with pagination support.
     """
     conn = get_db_cursor()
 
     try:
-        # 1. Fetch 1ms metadata watermark fingerprint
-        watermark = get_bills_watermark(conn, table_name="main.mart_recent_bills", chamber=chamber)
-        # 2. Build Cache Key
-        chamber_tag = chamber.lower() if chamber else "all"
-        cache_key = f"legipulse:recent_bills:{chamber_tag}:limit_{per_chamber_limit}:wm_{watermark}"
+        search_term = q.strip() if q and q.strip() else None
 
-        # 3. Read Path: Check Upstash Redis Cache
-        try:
-            cached_data = cache.get(cache_key)
-            if cached_data is not None:
-                response.headers["X-Cache"] = "HIT"
-                if isinstance(cached_data, (bytes, bytearray)):
-                    cached_data = cached_data.decode("utf-8")
-                return json.loads(cached_data) if isinstance(cached_data, str) else cached_data
-        except Exception as redis_err:
-            logger.warning(f"[Upstash Cache Miss/Error]: {redis_err}")
+        # 1. READ PATH (Cache default first-page requests only; skip cache for search or page > 1)
+        cache_key = None
+        if not search_term and page == 1:
+            watermark = get_bills_watermark(conn, table_name="main.mart_recent_bills", chamber=chamber)
+            chamber_tag = chamber.lower() if chamber else "all"
+            cache_key = f"legipulse:recent_bills:{chamber_tag}:limit_{per_chamber_limit}:wm_{watermark}"
 
-        # 4. Cache Miss Path: Query partitioned House and Senate datasets
-        conditions = []
+            try:
+                cached_data = cache.get(cache_key)
+                if cached_data is not None:
+                    response.headers["X-Cache"] = "HIT"
+                    if isinstance(cached_data, (bytes, bytearray)):
+                        cached_data = cached_data.decode("utf-8")
+                    return json.loads(cached_data) if isinstance(cached_data, str) else cached_data
+            except Exception as redis_err:
+                logger.warning(f"[Upstash Cache Miss/Error]: {redis_err}")
+
+        # 2. QUERY DUCKDB WITH PAGINATION WINDOW
+        conditions = ["bill_introduced_date >= CURRENT_DATE - INTERVAL '365 days'"]
         params = []
 
         if chamber and chamber.lower() in ("house", "senate"):
             conditions.append("LOWER(chamber) = LOWER(?)")
             params.append(chamber)
 
-        where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        if search_term:
+            conditions.append("""
+                (LOWER(bill_title) LIKE LOWER(?) 
+                 OR LOWER(bill_number) LIKE LOWER(?) 
+                 OR LOWER(sponsor_name) LIKE LOWER(?))
+            """)
+            like_pattern = f"%{search_term}%"
+            params.extend([like_pattern, like_pattern, like_pattern])
+
+        where_clause = f"WHERE {' AND '.join(conditions)}"
+
+        min_row = (page - 1) * per_chamber_limit + 1
+        max_row = page * per_chamber_limit
 
         query = f"""
+            WITH ranked_bills AS (
+                SELECT 
+                    bill_id, bill_number, congress, chamber, bill_title,
+                    bill_policy_area, bill_summary, bill_introduced_date,
+                    bill_latest_action_date, bill_latest_action_text,
+                    sponsor_bioguide_id, sponsor_name, sponsor_party, sponsor_state,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY LOWER(chamber) 
+                        ORDER BY bill_introduced_date DESC
+                    ) AS rn
+                FROM main.mart_recent_bills
+                {where_clause}
+            )
             SELECT 
-                bill_id,
-                bill_number,
-                congress,
-                chamber,
-                bill_title,
-                bill_policy_area,
-                bill_summary,
-                bill_introduced_date,
-                bill_latest_action_date,
-                bill_latest_action_text,
-                sponsor_bioguide_id,
-                sponsor_name,
-                sponsor_party,
-                sponsor_state
-            FROM main.mart_recent_bills
-            {where_clause}
-            QUALIFY ROW_NUMBER() OVER (
-                PARTITION BY LOWER(chamber) 
-                ORDER BY bill_introduced_date DESC
-            ) <= ?
+                bill_id, bill_number, congress, chamber, bill_title,
+                bill_policy_area, bill_summary, bill_introduced_date,
+                bill_latest_action_date, bill_latest_action_text,
+                sponsor_bioguide_id, sponsor_name, sponsor_party, sponsor_state
+            FROM ranked_bills
+            WHERE rn BETWEEN ? AND ?
             ORDER BY bill_introduced_date DESC;
         """
-        params.append(per_chamber_limit)
+        params.extend([min_row, max_row])
 
         rows = conn.execute(query, params).fetchall()
 
         bills = []
         for r in rows:
             (
-                bill_id,
-                bill_number,
-                congress,
-                chamber_name,
-                title,
-                policy_area,
-                raw_summary,
-                introduced_date,
-                latest_action_date,
-                latest_action_text,
-                sponsor_id,
-                sponsor_name,
-                sponsor_party,
-                sponsor_state,
+                bill_id, bill_number, congress, chamber_name, title, policy_area,
+                raw_summary, introduced_date, latest_action_date, latest_action_text,
+                sponsor_id, sponsor_name, sponsor_party, sponsor_state
             ) = r
 
             bill_type_clean = bill_number.split()[0].lower() if bill_number else ""
             bill_num_clean = bill_number.split()[-1] if bill_number else ""
 
             url_type_map = {
-                "hr": "house-bill",
-                "hres": "house-resolution",
-                "hjres": "house-joint-resolution",
-                "hconres": "house-concurrent-resolution",
-                "s": "senate-bill",
-                "sres": "senate-resolution",
-                "sjres": "senate-joint-resolution",
-                "sconres": "senate-concurrent-resolution"
+                "hr": "house-bill", "hres": "house-resolution", "hjres": "house-joint-resolution", "hconres": "house-concurrent-resolution",
+                "s": "senate-bill", "sres": "senate-resolution", "sjres": "senate-joint-resolution", "sconres": "senate-concurrent-resolution"
             }
             url_segment = url_type_map.get(bill_type_clean, "house-bill" if chamber_name == "House" else "senate-bill")
             congress_url = f"https://www.congress.gov/bill/{congress}th-congress/{url_segment}/{bill_num_clean}"
 
             clean_summary = strip_html(raw_summary)
-
-            # If clean_summary is empty or whitespace-only, set to None
             if clean_summary and not clean_summary.strip():
                 clean_summary = None
 
@@ -2247,19 +2245,24 @@ def get_recent_bills(
                 "sponsor_name": sponsor_name,
                 "sponsor_party": sponsor_party,
                 "sponsor_state": sponsor_state,
-                "is_bipartisan": False,
                 "congress_url": congress_url
             })
 
-        response_payload = {"bills": bills, "count": len(bills)}
+        # Check if more rows exist for subsequent pages
+        has_more = len(bills) >= (per_chamber_limit if chamber else per_chamber_limit * 2)
 
-        # 5. Write Path: Store in Redis with a 24-hour TTL (invalidation handled by watermark)
-        try:
-            cache.set(cache_key, json.dumps(jsonable_encoder(response_payload)), ex_seconds=86400)
-        except Exception as set_err:
-            logger.warning(f"[Upstash Cache Write Error]: {set_err}")
+        response_payload = {"bills": bills, "count": len(bills), "page": page, "has_more": has_more}
 
-        response.headers["X-Cache"] = "MISS"
+        # 3. WRITE PATH (Only write page 1 requests to Redis)
+        if cache_key:
+            try:
+                cache.set(cache_key, json.dumps(jsonable_encoder(response_payload)), ex_seconds=86400)
+            except Exception as set_err:
+                logger.warning(f"[Upstash Cache Write Error]: {set_err}")
+            response.headers["X-Cache"] = "MISS"
+        else:
+            response.headers["X-Cache"] = "BYPASS"
+
         return response_payload
 
     except Exception as e:
@@ -2371,72 +2374,89 @@ def get_lawmaker_track_record(politician_id: str):
         if conn:
             conn.close()
 
+# Add or replace get_recently_passed_bills in server.py
+
 @app.get("/api/bills/passed")
 def get_recently_passed_bills(
         response: Response,
-        per_chamber_limit: int = Query(default=10, ge=1, le=30, description="Number of passed bills per chamber"),
+        q: Optional[str] = Query(default=None, description="Search passed bills by title, number, or sponsor within 1 year"),
+        page: int = Query(default=1, ge=1, description="Page number for pagination"),
+        per_chamber_limit: int = Query(default=10, ge=1, le=50, description="Number of passed bills per chamber per page"),
         chamber: Optional[str] = Query(default=None, description="Filter by chamber ('House' or 'Senate')")
 ):
     """
-    Retrieves recently passed legislation (Passed House, Passed Senate, Became Law).
-    Uses window partitioning to balance House and Senate representation and caches via Upstash Redis.
+    Retrieves legislation passed within the past year (Passed House, Passed Senate, Became Law)
+    with window-based equal chamber pagination.
+    Standard feeds are cached via Upstash Redis; active search queries bypass Redis.
     """
     conn = get_db_cursor()
 
     try:
-        # 1. Fetch 1ms watermark
-        watermark = get_bills_watermark(conn, table_name="main.mart_recently_passed_bills", chamber=chamber)
-        # 2. Cache key
-        chamber_tag = chamber.lower() if chamber else "all"
-        cache_key = f"legipulse:passed_bills:{chamber_tag}:limit_{per_chamber_limit}:wm_{watermark}"
+        search_term = q.strip() if q and q.strip() else None
 
-        # 3. Cache Read
-        try:
-            cached_data = cache.get(cache_key)
-            if cached_data is not None:
-                response.headers["X-Cache"] = "HIT"
-                if isinstance(cached_data, (bytes, bytearray)):
-                    cached_data = cached_data.decode("utf-8")
-                return json.loads(cached_data) if isinstance(cached_data, str) else cached_data
-        except Exception as redis_err:
-            logger.warning(f"[Upstash Cache Miss/Error]: {redis_err}")
+        # 1. READ PATH (Cache default first-page requests only; skip cache for search or page > 1)
+        cache_key = None
+        if not search_term and page == 1:
+            watermark = get_bills_watermark(conn, table_name="main.mart_recently_passed_bills", chamber=chamber)
+            chamber_tag = chamber.lower() if chamber else "all"
+            cache_key = f"legipulse:passed_bills:{chamber_tag}:limit_{per_chamber_limit}:wm_{watermark}"
 
-        # 4. Cache Miss Path
-        conditions = []
+            try:
+                cached_data = cache.get(cache_key)
+                if cached_data is not None:
+                    response.headers["X-Cache"] = "HIT"
+                    if isinstance(cached_data, (bytes, bytearray)):
+                        cached_data = cached_data.decode("utf-8")
+                    return json.loads(cached_data) if isinstance(cached_data, str) else cached_data
+            except Exception as redis_err:
+                logger.warning(f"[Upstash Cache Miss/Error]: {redis_err}")
+
+        # 2. QUERY DUCKDB WITH PAGINATION WINDOW (365-Day Filter on bill_latest_action_date)
+        conditions = ["bill_latest_action_date >= CURRENT_DATE - INTERVAL '365 days'"]
         params = []
 
         if chamber and chamber.lower() in ("house", "senate"):
             conditions.append("LOWER(chamber) = LOWER(?)")
             params.append(chamber)
 
-        where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        if search_term:
+            conditions.append("""
+                (LOWER(bill_title) LIKE LOWER(?) 
+                 OR LOWER(bill_number) LIKE LOWER(?) 
+                 OR LOWER(sponsor_name) LIKE LOWER(?))
+            """)
+            like_pattern = f"%{search_term}%"
+            params.extend([like_pattern, like_pattern, like_pattern])
+
+        where_clause = f"WHERE {' AND '.join(conditions)}"
+
+        min_row = (page - 1) * per_chamber_limit + 1
+        max_row = page * per_chamber_limit
 
         query = f"""
+            WITH ranked_bills AS (
+                SELECT 
+                    bill_id, bill_number, congress, chamber, bill_title,
+                    bill_policy_area, bill_summary, bill_introduced_date,
+                    bill_latest_action_date, bill_latest_action_text, bill_status,
+                    sponsor_bioguide_id, sponsor_name, sponsor_party, sponsor_state,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY LOWER(chamber) 
+                        ORDER BY bill_latest_action_date DESC
+                    ) AS rn
+                FROM main.mart_recently_passed_bills
+                {where_clause}
+            )
             SELECT 
-                bill_id,
-                bill_number,
-                congress,
-                chamber,
-                bill_title,
-                bill_policy_area,
-                bill_summary,
-                bill_introduced_date,
-                bill_latest_action_date,
-                bill_latest_action_text,
-                bill_status,
-                sponsor_bioguide_id,
-                sponsor_name,
-                sponsor_party,
-                sponsor_state
-            FROM main.mart_recently_passed_bills
-            {where_clause}
-            QUALIFY ROW_NUMBER() OVER (
-                PARTITION BY LOWER(chamber) 
-                ORDER BY bill_latest_action_date DESC
-            ) <= ?
+                bill_id, bill_number, congress, chamber, bill_title,
+                bill_policy_area, bill_summary, bill_introduced_date,
+                bill_latest_action_date, bill_latest_action_text, bill_status,
+                sponsor_bioguide_id, sponsor_name, sponsor_party, sponsor_state
+            FROM ranked_bills
+            WHERE rn BETWEEN ? AND ?
             ORDER BY bill_latest_action_date DESC;
         """
-        params.append(per_chamber_limit)
+        params.extend([min_row, max_row])
 
         rows = conn.execute(query, params).fetchall()
 
@@ -2482,15 +2502,27 @@ def get_recently_passed_bills(
                 "congress_url": congress_url
             })
 
-        response_payload = {"bills": bills, "count": len(bills)}
+        # Calculate if more rows exist for infinite scroll
+        expected_count = per_chamber_limit if chamber else per_chamber_limit * 2
+        has_more = len(bills) >= expected_count
 
-        # 5. Write Path
-        try:
-            cache.set(cache_key, json.dumps(jsonable_encoder(response_payload)), ex_seconds=86400)
-        except Exception as set_err:
-            logger.warning(f"[Upstash Cache Write Error]: {set_err}")
+        response_payload = {
+            "bills": bills,
+            "count": len(bills),
+            "page": page,
+            "has_more": has_more
+        }
 
-        response.headers["X-Cache"] = "MISS"
+        # 3. WRITE PATH (Only write page 1 requests without search queries to Redis)
+        if cache_key:
+            try:
+                cache.set(cache_key, json.dumps(jsonable_encoder(response_payload)), ex_seconds=86400)
+            except Exception as set_err:
+                logger.warning(f"[Upstash Cache Write Error]: {set_err}")
+            response.headers["X-Cache"] = "MISS"
+        else:
+            response.headers["X-Cache"] = "BYPASS"
+
         return response_payload
 
     except Exception as e:
