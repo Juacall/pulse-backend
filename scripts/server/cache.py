@@ -107,9 +107,9 @@ class SafeRedisCache:
             cursor = 0
             deleted_count = 0
             while True:
-                cursor, keys = self._client.scan(cursor=cursor, match=pattern, count=100)
+                cursor, keys = self.client.scan(cursor=cursor, match=pattern, count=100)
                 if keys:
-                    self._client.delete(*keys)
+                    self.client.delete(*keys)
                     deleted_count += len(keys)
                 if cursor == 0:
                     break
