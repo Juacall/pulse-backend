@@ -25,7 +25,7 @@ from scripts.server.cache import cache
 from scripts.rag.agent import agent_executor, DB_PATH
 from scripts.rag.schema import DataResultPayload
 from scripts.rag.payload import sanitize_content_field, sanitize_payload
-from scripts.rag.database import connect_duckdb, database_label
+from scripts.database import connect_duckdb, database_label
 from scripts.rag.router import PreProcessingRouter, QueryAnalysis
 from scripts.server.rate_limiter import RateLimiter
 
@@ -109,15 +109,14 @@ class LoginResponse(BaseModel):
     email: str
 
 class ElectionCandidateResponse(BaseModel):
-    politician_id: str = Field(..., description="Unique FEC candidate ID or Bioguide ID")
-    name: str = Field(..., description="Full legal candidate name")
-    party: str = Field(..., description="Normalized party affiliation, e.g. Democratic, Republican")
-    is_incumbent: bool = Field(default=False, description="True if currently holding the office")
-    campaign_url: Optional[str] = Field(None, description="Verified campaign website URL")
-    total_receipts: float = Field(default=0.0, description="Total campaign funds raised from FEC filings")
-
-    class Config:
-        from_attributes = True
+    politician_id: str
+    name: str
+    party: Optional[str] = None
+    campaign_url: Optional[str] = None
+    is_incumbent: bool                          # Incumbent during race
+    is_currently_in_seat: bool = False          # Active seat holder today
+    is_winner: bool = False                     # Race winner flag
+    total_receipts: float = 0.0
 
 class ElectionSlateResponse(BaseModel):
     election_id: str = Field(..., example="2026_WA_H_01", description="Composite election slate key")
@@ -214,6 +213,34 @@ class StateIncumbentSplitMetrics(BaseModel):
     total_receipts_dollars: float
     grassroots_pct: float
 
+class TopDonorResponse(BaseModel):
+    donor_name: str
+    donor_type: str
+    cycle: str
+    total_amount_contributed: float
+    politicians_funded: int
+    top_recipient_name: Optional[str] = None
+    top_recipient_amount: Optional[float] = None
+
+class LeaderboardResponse(BaseModel):
+    cycle: str
+    total_count: int
+    donors: List[TopDonorResponse]
+
+class SuperPacImpactItem(BaseModel):
+    super_pac_name: str
+    cycle: str
+    total_support_spending: float
+    total_oppose_spending: float
+    total_independent_expenditures: float
+    candidates_targeted: int
+    top_target_candidate: Optional[str] = None
+    top_target_amount: Optional[float] = None
+
+class SuperPacImpactResponse(BaseModel):
+    cycle: str
+    total_count: int
+    super_pacs: List[SuperPacImpactItem]
 
 # Enable CORS for Vite dev server (and production domains)
 app.add_middleware(
@@ -779,6 +806,99 @@ def fetch_vote_aggregates_from_supabase() -> Dict[str, Dict[str, int]]:
 
     return vote_map
 
+
+@app.get("/api/seats/{seat_id}")
+def get_seat_detail(seat_id: str):
+    """
+    Returns seat metadata, active incumbent, and historical tenures.
+    Normalizes seat_id to handle unpadded or zero-padded district numbers.
+    """
+    conn = get_db_cursor()
+    try:
+        # Normalize WA-H-1 -> WA-H-01
+        parts = seat_id.upper().strip().split("-")
+        if len(parts) == 3 and parts[1] == "H":
+            clean_seat_id = f"{parts[0]}-H-{parts[2].zfill(2)}"
+        else:
+            clean_seat_id = seat_id.upper().strip()
+
+        # 1. Fetch seat metadata and current active incumbent
+        seat_query = """
+                     SELECT
+                         s.seat_id,
+                         s.state_code,
+                         s.chamber,
+                         s.district,
+                         s.seat_class,
+                         p.bioguide_id AS incumbent_id,
+                         p.name AS incumbent_name,
+                         p.party AS incumbent_party,
+                         p.imageUrl AS incumbent_image,
+                         t.start_year AS tenure_start_year,
+                         t.congress AS tenure_congress
+                     FROM main.dim_seats s
+                              LEFT JOIN main.fct_seat_tenures t
+                                        ON s.seat_id = t.seat_id AND t.is_current_incumbent = TRUE
+                              LEFT JOIN main.dim_politicians p
+                                        ON t.politician_id = p.bioguide_id
+                     WHERE s.seat_id = ?; \
+                     """
+        seat_row = conn.execute(seat_query, [clean_seat_id]).fetchone()
+
+        if not seat_row:
+            raise HTTPException(status_code=404, detail=f"Seat {seat_id} not found")
+
+        # 2. Fetch complete tenure history
+        tenure_query = """
+                       SELECT
+                           t.tenure_id,
+                           t.congress,
+                           t.start_year,
+                           t.end_year,
+                           t.is_current_incumbent,
+                           p.bioguide_id,
+                           p.name,
+                           p.party
+                       FROM main.fct_seat_tenures t
+                                JOIN main.dim_politicians p ON t.politician_id = p.bioguide_id
+                       WHERE t.seat_id = ?
+                       ORDER BY t.start_year DESC, t.congress DESC; \
+                       """
+        history_rows = conn.execute(tenure_query, [clean_seat_id]).fetchall()
+
+        history = [
+            {
+                "tenure_id": r[0],
+                "congress": r[1],
+                "start_year": r[2],
+                "end_year": r[3],
+                "is_current_incumbent": bool(r[4]),
+                "politician_id": r[5],
+                "name": r[6],
+                "party": r[7]
+            }
+            for r in history_rows
+        ]
+
+        return {
+            "seat_id": seat_row[0],
+            "state_code": seat_row[1],
+            "chamber": seat_row[2],
+            "district": seat_row[3],
+            "seat_class": seat_row[4],
+            "incumbent": {
+                "bioguide_id": seat_row[5],
+                "name": seat_row[6],
+                "party": seat_row[7],
+                "image_url": seat_row[8],
+                "start_year": seat_row[9],
+                "congress": seat_row[10]
+            } if seat_row[5] else None,
+            "tenure_history": history
+        }
+    finally:
+        conn.close()
+
 @app.get("/api/politicians/list", dependencies=[Depends(standard_limiter)])
 def get_politicians_list(
         state: Optional[str] = None,
@@ -1110,7 +1230,7 @@ def get_politician_donors(politician_id: str, cycle: Optional[int] = None):
         if cycle is not None:
             sql += " AND cycle = ?"
             params.append(str(cycle))
-        sql += " ORDER BY amount DESC, donor_name ASC"
+        sql += " ORDER BY amount DESC, donor_name ASC LIMIT 5"
 
         records = conn.execute(sql, params).fetchdf().to_dict(orient="records")
 
@@ -1589,25 +1709,25 @@ def get_state_elections(
     except Exception as err:
         logger.warning(f"Redis read error for election cache key {cache_key}: {err}")
 
-    # 2. Database Query (Cache Miss)
+    # 2. Database Query (Querying mart_elections directly)
     try:
         conn = get_db_cursor()
         query = """
                 SELECT
-                    e.election_id,
-                    e.office_sought,
-                    e.district,
-                    p.id AS politician_id,
-                    p.name,
-                    p.party,
-                    p.campaign,
-                    rc.is_incumbent,
-                    COALESCE(p.total_receipts, 0.0) AS total_receipts
-                FROM main.fct_elections e
-                         JOIN main.fct_race_candidates rc ON e.election_id = rc.election_id
-                         JOIN main.dim_politicians p ON rc.politician_id = p.id
-                WHERE e.state_code = ? AND e.election_cycle = ?
-                ORDER BY e.office_sought DESC, e.district ASC;
+                    election_id,
+                    office_sought,
+                    district,
+                    politician_id,
+                    candidate_name,
+                    party,
+                    campaign_url,
+                    is_incumbent_during_race,
+                    is_currently_in_seat,
+                    is_winner,
+                    COALESCE(total_receipts, 0.0) AS total_receipts
+                FROM main.mart_elections
+                WHERE state_code = ? AND election_cycle = ?
+                ORDER BY office_sought DESC, district ASC, total_receipts DESC;
                 """
         rows = conn.execute(query, [state_clean, cycle]).fetchall()
         conn.close()
@@ -1629,8 +1749,10 @@ def get_state_elections(
                     name=r[4],
                     party=r[5],
                     campaign_url=r[6],
-                    is_incumbent=r[7],
-                    total_receipts=r[8]
+                    is_incumbent=bool(r[7]),
+                    is_currently_in_seat=bool(r[8]),
+                    is_winner=bool(r[9]),
+                    total_receipts=float(r[10])
                 )
             )
 
@@ -1664,6 +1786,172 @@ def get_state_elections(
 # -------------------------------------------------------------------
 # Analytics Endpoints
 # -------------------------------------------------------------------
+
+@app.get(
+    "/api/analytics/super-pacs/impact",
+    response_model=SuperPacImpactResponse,
+    summary="Get Super PAC Independent Expenditure Impact Analysis"
+)
+def get_super_pac_impact(
+        cycle: str = Query("2026", description="FEC Election Cycle"),
+        limit: int = Query(50, ge=1, le=500, description="Number of Super PACs to return")
+):
+    conn = None
+    cache_key = f"analytics:super_pacs:impact:{cycle}:limit_{limit}"
+
+    # 1. Redis Cache Read
+    try:
+        cached_payload = cache.get(cache_key)
+        if cached_payload:
+            if isinstance(cached_payload, (bytes, bytearray)):
+                cached_payload = cached_payload.decode("utf-8")
+            data = json.loads(cached_payload) if isinstance(cached_payload, str) else cached_payload
+            return SuperPacImpactResponse(**data)
+    except Exception as err:
+        logger.warning(f"Redis read error for key {cache_key}: {err}")
+
+    # 2. Database Read (DuckDB)
+    try:
+        conn = get_db_cursor()
+        query = """
+                SELECT
+                    super_pac_name,
+                    cycle,
+                    total_support_spending,
+                    total_oppose_spending,
+                    total_independent_expenditures,
+                    candidates_targeted,
+                    top_target_candidate,
+                    top_target_amount
+                FROM main.v_super_pac_impact
+                WHERE cycle = ?
+                ORDER BY total_independent_expenditures DESC
+                    LIMIT ?; \
+                """
+        results = conn.execute(query, [cycle, limit]).fetchall()
+
+        items = [
+            SuperPacImpactItem(
+                super_pac_name=row[0],
+                cycle=row[1],
+                total_support_spending=float(row[2]),
+                total_oppose_spending=float(row[3]),
+                total_independent_expenditures=float(row[4]),
+                candidates_targeted=int(row[5]),
+                top_target_candidate=row[6],
+                top_target_amount=float(row[7]) if row[7] is not None else None
+            )
+            for row in results
+        ]
+
+        payload = SuperPacImpactResponse(
+            cycle=cycle,
+            total_count=len(items),
+            super_pacs=items
+        )
+
+        # 3. Redis Cache Write (24-Hour TTL)
+        try:
+            cache.set(
+                cache_key,
+                json.dumps(jsonable_encoder(payload)),
+                ex_seconds=CACHE_TTL_24
+            )
+        except Exception as err:
+            logger.warning(f"Redis write error for key {cache_key}: {err}")
+
+        return payload
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to retrieve Super PAC impact analytics: {str(e)}"
+        )
+    finally:
+        if conn:
+            conn.close()
+
+@app.get(
+    "/api/donors/leaderboard",
+    response_model=LeaderboardResponse,
+    summary="Get Top Direct Organizational & PAC Donors Leaderboard"
+)
+def get_top_donors_leaderboard(
+        cycle: str = Query("2026", description="FEC Election Cycle"),
+        limit: int = Query(50, ge=1, le=500, description="Number of top donors to return")
+):
+    conn = None
+    cache_key = f"analytics:donors:leaderboard:{cycle}:limit_{limit}"
+
+    # 1. Cache Read Path (Upstash Redis)
+    try:
+        cached_payload = cache.get(cache_key)
+        if cached_payload:
+            if isinstance(cached_payload, (bytes, bytearray)):
+                cached_payload = cached_payload.decode("utf-8")
+            data = json.loads(cached_payload) if isinstance(cached_payload, str) else cached_payload
+            return LeaderboardResponse(**data)
+    except Exception as err:
+        logger.warning(f"Redis read error for key {cache_key}: {err}")
+
+    # 2. Database Fetch Path (DuckDB)
+    try:
+        conn = get_db_cursor()
+        query = """
+                SELECT
+                    donor_name,
+                    donor_type,
+                    cycle,
+                    total_amount_contributed,
+                    politicians_funded,
+                    top_recipient_name,
+                    top_recipient_amount
+                FROM main.v_global_top_donors_leaderboard
+                WHERE cycle = ?
+                ORDER BY total_amount_contributed DESC
+                    LIMIT ?; \
+                """
+        results = conn.execute(query, [cycle, limit]).fetchall()
+
+        donor_items = [
+            TopDonorResponse(
+                donor_name=row[0],
+                donor_type=row[1] if row[1] else "PAC",
+                cycle=row[2],
+                total_amount_contributed=float(row[3]),
+                politicians_funded=int(row[4]),
+                top_recipient_name=row[5],
+                top_recipient_amount=float(row[6]) if row[6] is not None else None
+            )
+            for row in results
+        ]
+
+        payload = LeaderboardResponse(
+            cycle=cycle,
+            total_count=len(donor_items),
+            donors=donor_items
+        )
+
+        # 3. Cache Write Path (24-Hour TTL)
+        try:
+            cache.set(
+                cache_key,
+                json.dumps(jsonable_encoder(payload)),
+                ex_seconds=CACHE_TTL_24
+            )
+        except Exception as err:
+            logger.warning(f"Redis write error for key {cache_key}: {err}")
+
+        return payload
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to retrieve donor leaderboard: {str(e)}"
+        )
+    finally:
+        if conn:
+            conn.close()
 
 @app.get(
     "/api/analytics/donations/national-summary",
@@ -2084,6 +2372,79 @@ def get_state_incumbent_vs_challenger_donations(state: str):
         if conn:
             conn.close()
 
+# Target Candidate details for a specific Super PAC
+@app.get("/api/analytics/super-pacs/{super_pac_name}/targets")
+def get_super_pac_targets(super_pac_name: str, cycle: str = "2026"):
+    conn = get_db_cursor()
+    try:
+        # Trim and normalize both sides of the comparison
+        query = """
+                SELECT
+                    candidate_name,
+                    stance,
+                    SUM(amount) AS total_amount
+                FROM main.stg_fec_independent_expenditures
+                WHERE TRIM(LOWER(super_pac_name)) = TRIM(LOWER(?))
+                  AND cycle = ?
+                  AND candidate_name IS NOT NULL
+                GROUP BY candidate_name, stance
+                ORDER BY total_amount DESC; \
+                """
+        results = conn.execute(query, [super_pac_name, cycle]).fetchall()
+
+        targets = [
+            {
+                "candidate_name": row[0],
+                "stance": row[1],
+                "amount": float(row[2])
+            }
+            for row in results
+        ]
+        return {"super_pac_name": super_pac_name, "targets": targets}
+    finally:
+        conn.close()
+
+@app.get("/api/analytics/donations/by-state/{state_code}/candidates")
+def get_candidates_by_state(state_code: str):
+    conn = get_db_cursor()
+    try:
+        query = """
+                SELECT
+                    p.name,
+                    p.chamber AS office,
+                    p.status,
+                    p.is_incumbent,
+                    ROUND(COALESCE(SUM(s.individual_unitemized), 0.0), 2) AS total_grassroots_dollars,
+                    ROUND(COALESCE(SUM(s.individual_itemized), 0.0), 2) AS total_large_donor_dollars,
+                    ROUND(COALESCE(SUM(s.pac_contributions), 0.0), 2) AS total_pac_dollars,
+                    ROUND(COALESCE(SUM(s.total_receipts), 0.0), 2) AS total_receipts
+                FROM main.dim_politicians p
+                         LEFT JOIN main.politician_fec_summary s
+                                   ON p.fec_candidate_id = s.fec_candidate_id
+                WHERE UPPER(p.state) = UPPER(?)
+                GROUP BY
+                    p.name,
+                    p.chamber,
+                    p.status,
+                    p.is_incumbent
+                ORDER BY total_receipts DESC;
+                """
+        results = conn.execute(query, [state_code]).fetchall()
+        candidates = [
+            {
+                "name": row[0],
+                "office": row[1] or "Federal Office",
+                "incumbent_challenge_full": row[2] or ("Incumbent" if row[3] else "Challenger"),
+                "total_grassroots_dollars": float(row[4]),
+                "total_large_donor_dollars": float(row[5]),
+                "total_pac_dollars": float(row[6]),
+                "total_receipts": float(row[7]),
+            }
+            for row in results
+        ]
+        return {"state": state_code.upper(), "candidates": candidates}
+    finally:
+        conn.close()
 # ------------------------------------------------------------------
 # 1. Legislative Tracking Endpoints
 # ------------------------------------------------------------------
