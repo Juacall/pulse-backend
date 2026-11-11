@@ -225,7 +225,7 @@ def test_politician_donors_returns_donors_and_filters_by_cycle(
     db_path = tmp_path / "donors.duckdb"
     conn = duckdb.connect(str(db_path))
     conn.execute("""
-        CREATE TABLE member_top_donors (\
+        CREATE TABLE politician_top_donors (\
             bioguide_id VARCHAR,
             donor_name VARCHAR,
             amount DOUBLE,
@@ -234,7 +234,7 @@ def test_politician_donors_returns_donors_and_filters_by_cycle(
         )
     """)
     conn.executemany(
-        "INSERT INTO member_top_donors VALUES (?, ?, ?, ?, ?)",
+        "INSERT INTO politician_top_donors VALUES (?, ?, ?, ?, ?)",
         [
             ("H1", "Small Donor", 100.0, "Industry A", "2024"),
             ("H1", "Large Donor", 500.0, "Industry B", "2024"),

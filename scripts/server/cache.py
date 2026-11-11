@@ -11,6 +11,15 @@ load_project_environment()
 
 logger = logging.getLogger("uvicorn.error")
 REDIS_TIMEOUT_SECONDS = 2.0
+# Unset ENV falls back to "prod"; set ENV explicitly in every non-prod environment
+ENV = (os.getenv("ENV") or "prod").strip().lower()
+
+
+def env_key(key: str) -> str:
+    """Namespaces a cache key by environment so non-prod writes never collide with prod."""
+    prefix = f"{ENV}:"
+    return key if key.startswith(prefix) else f"{prefix}{key}"
+
 
 class SafeRedisCache:
     def __init__(self):
@@ -34,7 +43,7 @@ class SafeRedisCache:
         if not self.client:
             return None
         try:
-            val = self.client.get(key)
+            val = self.client.get(env_key(key))
             if val is None:
                 return None
             return json.loads(val) if isinstance(val, str) else val
@@ -48,7 +57,7 @@ class SafeRedisCache:
             return False
         try:
             serialized = json.dumps(value, default=str)
-            self.client.set(key, serialized, ex=ex_seconds)
+            self.client.set(env_key(key), serialized, ex=ex_seconds)
             return True
         except Exception as e:
             logger.warning(f"Redis WRITE error for key '{key}': {e}. Continuing without caching.")
@@ -74,6 +83,7 @@ class SafeRedisCache:
 
             if not flat_keys:
                 return 0
+            flat_keys = [env_key(k) for k in flat_keys]
 
             # Upstash Redis SDK accepts *flat_keys positional arguments
             deleted_count = self.client.delete(*flat_keys)
@@ -83,17 +93,13 @@ class SafeRedisCache:
             logger.warning(f"Redis DELETE error for keys={keys}: {err}. Continuing without cache eviction.")
             return 0
 
-        def invalidate_user_cache(user_id: str):
-            """Purges cached user summary keys from Redis."""
-            try:
-                # Match keys constructed in get_user_summary
-                keys_to_delete = [
-                    f"user:{user_id}:summary",
-                ]
-                cache.delete(*keys_to_delete)
-                logger.info(f"Successfully invalidated Redis cache for user_id={user_id}")
-            except Exception as err:
-                logger.warning(f"Failed to invalidate Redis cache for user_id={user_id}: {err}")
+    def invalidate_user_cache(self, user_id: str):
+        """Purges cached user summary keys from Redis."""
+        try:
+            self.delete(f"user:{user_id}:summary")
+            logger.info(f"Successfully invalidated Redis cache for user_id={user_id}")
+        except Exception as err:
+            logger.warning(f"Failed to invalidate Redis cache for user_id={user_id}: {err}")
 
 # Export a single global instance
 cache = SafeRedisCache()

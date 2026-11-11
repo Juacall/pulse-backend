@@ -18,7 +18,7 @@ from langchain_core.tools import tool
 from langchain_voyageai import VoyageAIEmbeddings
 from typing import List, Dict, Any, Optional, Literal
 from scripts.rag.router import PreProcessingRouter
-from scripts.rag.database import (
+from scripts.database import (
     LOCAL_DB_PATH as DB_PATH,
     connect_duckdb,
     use_motherduck,
