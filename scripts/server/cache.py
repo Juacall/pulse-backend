@@ -101,5 +101,22 @@ class SafeRedisCache:
         except Exception as err:
             logger.warning(f"Failed to invalidate Redis cache for user_id={user_id}: {err}")
 
+    def delete_pattern(self, pattern: str) -> int:
+        """Safely scans and deletes keys matching a pattern."""
+        try:
+            cursor = 0
+            deleted_count = 0
+            while True:
+                cursor, keys = self._client.scan(cursor=cursor, match=pattern, count=100)
+                if keys:
+                    self._client.delete(*keys)
+                    deleted_count += len(keys)
+                if cursor == 0:
+                    break
+            return deleted_count
+        except Exception as err:
+            logger.error(f"SafeRedisCache delete_pattern error: {err}")
+            return 0
+
 # Export a single global instance
 cache = SafeRedisCache()

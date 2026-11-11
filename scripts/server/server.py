@@ -2982,48 +2982,14 @@ def invalidate_analytical_cache(
         prefix: str = "analytics:",
         x_internal_token: str = Header(...)
 ):
-    """Purges cached analytical endpoints when MotherDuck finishes data refresh."""
     if x_internal_token != INTERNAL_API_SECRET:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid authorization token."
-        )
+        raise HTTPException(status_code=401, detail="Invalid token.")
 
     try:
-        # Determine underlying client (check common wrapper attribute names)
-        redis_client = getattr(cache, "client", None) or getattr(cache, "_redis", None) or getattr(cache, "redis", None)
-
-        if redis_client is not None and hasattr(redis_client, "scan"):
-            cursor = 0
-            deleted_count = 0
-            pattern = f"{prefix}*"
-
-            while True:
-                cursor, keys = redis_client.scan(cursor=cursor, match=pattern, count=100)
-                if keys:
-                    redis_client.delete(*keys)
-                    deleted_count += len(keys)
-                if cursor == 0:
-                    break
-        else:
-            # Fallback if SafeRedisCache exposes flush_pattern or similar methods
-            if hasattr(cache, "delete_pattern"):
-                deleted_count = cache.delete_pattern(f"{prefix}*")
-            elif hasattr(cache, "flush_all"):
-                cache.flush_all()
-                deleted_count = -1
-            else:
-                raise AttributeError("SafeRedisCache has no accessible underlying client or scan method.")
-
-        logger.info(f"Purged cache keys matching pattern '{prefix}*'")
+        deleted_count = cache.delete_pattern(f"{prefix}*")
         return {"status": "success", "keys_invalidated": deleted_count}
-
     except Exception as e:
-        logger.error(f"Failed to invalidate cache: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Cache invalidation error: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Cache invalidation error: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
