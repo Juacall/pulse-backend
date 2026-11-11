@@ -1849,18 +1849,23 @@ def get_super_pac_impact(
     # 2. Database Read (DuckDB)
     try:
         conn = get_db_cursor()
+
+        # Aggregates by normalized super_pac_name, filters out non-committee filers, & excludes >$50M outliers
         query = """
                 SELECT
-                    super_pac_name,
+                    REGEXP_REPLACE(UPPER(TRIM(super_pac_name)), '\\s+', ' ', 'g') AS norm_pac_name,
                     cycle,
-                    total_support_spending,
-                    total_oppose_spending,
-                    total_independent_expenditures,
-                    candidates_targeted,
-                    top_target_candidate,
-                    top_target_amount
-                FROM main.v_super_pac_impact
+                    ROUND(SUM(CASE WHEN stance = 'SUPPORT' THEN amount ELSE 0 END), 2) AS total_support_spending,
+                    ROUND(SUM(CASE WHEN stance = 'OPPOSE' THEN amount ELSE 0 END), 2) AS total_oppose_spending,
+                    ROUND(SUM(amount), 2) AS total_independent_expenditures,
+                    COUNT(DISTINCT fec_candidate_id) AS candidates_targeted,
+                    ARG_MAX(candidate_name, amount) AS top_target_candidate,
+                    ROUND(MAX(amount), 2) AS top_target_amount
+                FROM main.stg_fec_independent_expenditures
                 WHERE cycle = ?
+                  AND super_pac_id LIKE 'C%'
+                  AND amount BETWEEN 1.0 AND 50000000.0
+                GROUP BY norm_pac_name, cycle
                 ORDER BY total_independent_expenditures DESC
                     LIMIT ?; \
                 """
@@ -1902,6 +1907,68 @@ def get_super_pac_impact(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to retrieve Super PAC impact analytics: {str(e)}"
+        )
+    finally:
+        if conn:
+            conn.close()
+
+
+# Target Candidate details for a specific Super PAC
+@app.get("/api/analytics/super-pacs/{super_pac_name}/targets")
+def get_super_pac_targets(super_pac_name: str, cycle: str = "2026"):
+    # Normalize input parameter for cache key
+    norm_input_name = " ".join(super_pac_name.strip().upper().split())
+    cache_key = f"analytics:super_pacs:targets:{cycle}:{norm_input_name.lower()}"
+
+    try:
+        cached_targets = cache.get(cache_key)
+        if cached_targets is not None:
+            if isinstance(cached_targets, (bytes, bytearray)):
+                cached_targets = cached_targets.decode("utf-8")
+            return json.loads(cached_targets) if isinstance(cached_targets, str) else cached_targets
+    except Exception as err:
+        logger.warning(f"Redis read error for key {cache_key}: {err}")
+
+    conn = get_db_cursor()
+    try:
+        # Match using normalized super_pac_name and candidate_name
+        query = """
+                SELECT
+                    REGEXP_REPLACE(UPPER(TRIM(candidate_name)), '\\s+', ' ', 'g') AS norm_candidate_name,
+                    stance,
+                    ROUND(SUM(amount), 2) AS total_amount
+                FROM main.stg_fec_independent_expenditures
+                WHERE REGEXP_REPLACE(UPPER(TRIM(super_pac_name)), '\\s+', ' ', 'g') = ?
+                  AND cycle = ?
+                  AND candidate_name IS NOT NULL
+                  AND super_pac_id LIKE 'C%'
+                  AND amount BETWEEN 1.0 AND 50000000.0
+                GROUP BY norm_candidate_name, stance
+                ORDER BY total_amount DESC; \
+                """
+        results = conn.execute(query, [norm_input_name, cycle]).fetchall()
+
+        targets = [
+            {
+                "candidate_name": row[0],
+                "stance": row[1],
+                "amount": float(row[2])
+            }
+            for row in results
+        ]
+
+        payload = {"super_pac_name": norm_input_name, "targets": targets}
+
+        try:
+            cache.set(cache_key, json.dumps(jsonable_encoder(payload)), ex_seconds=CACHE_TTL_24)
+        except Exception as err:
+            logger.warning(f"Redis write error for key {cache_key}: {err}")
+
+        return payload
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to retrieve Super PAC targets: {str(e)}"
         )
     finally:
         if conn:
@@ -2408,44 +2475,7 @@ def get_state_incumbent_vs_challenger_donations(state: str):
         if conn:
             conn.close()
 
-# Target Candidate details for a specific Super PAC
-@app.get("/api/analytics/super-pacs/{super_pac_name}/targets")
-def get_super_pac_targets(super_pac_name: str, cycle: str = "2026"):
-    cache_key = f"analytics:super_pacs:targets:{cycle}:{super_pac_name.strip().lower()}"
-    cached_targets = cache.get(cache_key)
-    if cached_targets is not None:
-        return cached_targets
 
-    conn = get_db_cursor()
-    try:
-        # Trim and normalize both sides of the comparison
-        query = """
-                SELECT
-                    candidate_name,
-                    stance,
-                    SUM(amount) AS total_amount
-                FROM main.stg_fec_independent_expenditures
-                WHERE TRIM(LOWER(super_pac_name)) = TRIM(LOWER(?))
-                  AND cycle = ?
-                  AND candidate_name IS NOT NULL
-                GROUP BY candidate_name, stance
-                ORDER BY total_amount DESC; \
-                """
-        results = conn.execute(query, [super_pac_name, cycle]).fetchall()
-
-        targets = [
-            {
-                "candidate_name": row[0],
-                "stance": row[1],
-                "amount": float(row[2])
-            }
-            for row in results
-        ]
-        payload = {"super_pac_name": super_pac_name, "targets": targets}
-        cache.set(cache_key, payload, ex_seconds=CACHE_TTL_24)
-        return payload
-    finally:
-        conn.close()
 
 @app.get("/api/analytics/donations/by-state/{state_code}/candidates")
 def get_candidates_by_state(state_code: str):
@@ -2534,7 +2564,6 @@ def get_bills_watermark(
     return hashlib.md5(raw_wm.encode("utf-8")).hexdigest()[:12]
 
 
-# app/routers/bills.py or server.py
 
 @app.get("/api/bills/recent")
 def get_recent_bills(
