@@ -102,20 +102,45 @@ class SafeRedisCache:
             logger.warning(f"Failed to invalidate Redis cache for user_id={user_id}: {err}")
 
     def delete_pattern(self, pattern: str) -> int:
-        """Safely scans and deletes keys matching a pattern."""
+        """
+        Safely scans and deletes keys matching a pattern, automatically
+        scoping the pattern with the current environment prefix (e.g. 'dev:' or 'prod:').
+        """
+        if not self.client:
+            return 0
+
         try:
+            # Inject environment prefix into search pattern (e.g., "analytics:*" -> "dev:analytics:*")
+            search_pattern = env_key(pattern)
+
             cursor = 0
             deleted_count = 0
+
             while True:
-                cursor, keys = self.client.scan(cursor=cursor, match=pattern, count=100)
+                # Upstash SDK scan call
+                scan_res = self.client.scan(cursor=cursor, match=search_pattern, count=100)
+
+                # Unpack tuple (next_cursor, keys) from Upstash response
+                if isinstance(scan_res, (list, tuple)) and len(scan_res) == 2:
+                    cursor, keys = scan_res
+                elif hasattr(scan_res, "cursor") and hasattr(scan_res, "keys"):
+                    cursor, keys = scan_res.cursor, scan_res.keys
+                else:
+                    cursor, keys = 0, []
+
                 if keys:
-                    self.client.delete(*keys)
-                    deleted_count += len(keys)
-                if cursor == 0:
+                    # Pass raw keys to self.client.delete directly since they already contain env_key
+                    count = self.client.delete(*keys)
+                    deleted_count += (count or len(keys))
+
+                # Stop when cursor reaches 0 or '0'
+                if str(cursor) == "0":
                     break
+
+            logger.info(f"Purged {deleted_count} Redis keys matching pattern '{search_pattern}'")
             return deleted_count
         except Exception as err:
-            logger.error(f"SafeRedisCache delete_pattern error: {err}")
+            logger.error(f"SafeRedisCache delete_pattern error for pattern={pattern}: {err}")
             return 0
 
 # Export a single global instance
