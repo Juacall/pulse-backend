@@ -11,7 +11,8 @@ load_project_environment()
 logger = logging.getLogger("uvicorn.error")
 
 LOCAL_DB_PATH = Path(__file__).resolve().parents[2] / "dev.duckdb"
-MOTHERDUCK_DB_NAME = os.getenv("MOTHERDUCK_DB_NAME") or "pulse_prod"
+MOTHERDUCK_DB_NAME = os.getenv("MOTHERDUCK_DB_NAME")
+ENV = os.getenv("ENV")
 _logged_targets: set[str] = set()
 
 
@@ -23,8 +24,15 @@ def local_fallback_allowed() -> bool:
     return os.getenv("ALLOW_LOCAL_DB_FALLBACK", "").strip().lower() in {"1", "true", "yes"}
 
 
+def motherduck_target() -> str:
+    if not MOTHERDUCK_DB_NAME:
+        raise RuntimeError("MOTHERDUCK_DB_NAME is not set.")
+    name = f"{MOTHERDUCK_DB_NAME}_{ENV}" if ENV else MOTHERDUCK_DB_NAME
+    return f"md:{name}"
+
+
 def database_label(local_path: Path = LOCAL_DB_PATH) -> str:
-    return f"md:{MOTHERDUCK_DB_NAME}" if use_motherduck() else str(local_path)
+    return motherduck_target() if use_motherduck() else str(local_path)
 
 
 def _log_once(level: int, key: str, message: str, *args) -> None:
@@ -36,8 +44,9 @@ def _log_once(level: int, key: str, message: str, *args) -> None:
 def connect_duckdb(local_path: Path = LOCAL_DB_PATH) -> duckdb.DuckDBPyConnection:
     """Connect to MotherDuck; the local file is used only when ALLOW_LOCAL_DB_FALLBACK is true."""
     if use_motherduck():
-        _log_once(logging.INFO, "md", "Using MotherDuck database '%s'.", MOTHERDUCK_DB_NAME)
-        return duckdb.connect(f"md:{MOTHERDUCK_DB_NAME}")
+        target = motherduck_target()
+        _log_once(logging.INFO, "md", "Using MotherDuck database '%s'.", target)
+        return duckdb.connect(target)
 
     if not local_fallback_allowed():
         message = (

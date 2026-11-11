@@ -3,6 +3,8 @@ import time
 from fastapi import Request, HTTPException, status
 from upstash_redis import Redis
 
+from scripts.server.cache import env_key
+
 # Initialize Upstash REST Client
 redis = Redis(
     url=os.getenv("UPSTASH_REDIS_REST_URL"),
@@ -46,7 +48,7 @@ class RateLimiter:
     async def __call__(self, request: Request):
         # Identify user via JWT/Session state or fallback to IP address
         user_id = getattr(request.state, "user_id", request.client.host)
-        key = f"rate_limit:{request.url.path}:{user_id}"
+        key = env_key(f"rate_limit:{request.url.path}:{user_id}")
         now = time.time()
 
         # Execute Lua script atomically on Upstash
