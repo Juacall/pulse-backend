@@ -1915,61 +1915,85 @@ def get_super_pac_impact(
 
 
 # Target Candidate details for a specific Super PAC
-@app.get("/api/analytics/super-pacs/{super_pac_name}/targets")
-def get_super_pac_targets(super_pac_name: str, cycle: str = "2026"):
-    # Normalize input parameter for cache key
-    norm_input_name = " ".join(super_pac_name.strip().upper().split())
-    cache_key = f"analytics:super_pacs:targets:{cycle}:{norm_input_name.lower()}"
+@app.get(
+    "/api/analytics/super-pacs/impact",
+    response_model=SuperPacImpactResponse,
+    summary="Get Super PAC Independent Expenditure Impact Analysis"
+)
+def get_super_pac_impact(
+        cycle: str = Query("2026", description="FEC Election Cycle"),
+        limit: int = Query(50, ge=1, le=500, description="Number of Super PACs to return")
+):
+    conn = None
+    cache_key = f"analytics:super_pacs:impact:{cycle}:limit_{limit}"
 
     try:
-        cached_targets = cache.get(cache_key)
-        if cached_targets is not None:
-            if isinstance(cached_targets, (bytes, bytearray)):
-                cached_targets = cached_targets.decode("utf-8")
-            return json.loads(cached_targets) if isinstance(cached_targets, str) else cached_targets
+        cached_payload = cache.get(cache_key)
+        if cached_payload:
+            if isinstance(cached_payload, (bytes, bytearray)):
+                cached_payload = cached_payload.decode("utf-8")
+            data = json.loads(cached_payload) if isinstance(cached_payload, str) else cached_payload
+            return SuperPacImpactResponse(**data)
     except Exception as err:
         logger.warning(f"Redis read error for key {cache_key}: {err}")
 
-    conn = get_db_cursor()
     try:
-        # Match using normalized super_pac_name and candidate_name
+        conn = get_db_cursor()
+
+        # Query the newly materialized dbt mart directly
         query = """
                 SELECT
-                    REGEXP_REPLACE(UPPER(TRIM(candidate_name)), '\\s+', ' ', 'g') AS norm_candidate_name,
-                    stance,
-                    ROUND(SUM(amount), 2) AS total_amount
-                FROM main.stg_fec_independent_expenditures
-                WHERE REGEXP_REPLACE(UPPER(TRIM(super_pac_name)), '\\s+', ' ', 'g') = ?
-                  AND cycle = ?
-                  AND candidate_name IS NOT NULL
-                  AND super_pac_id LIKE 'C%'
-                  AND amount BETWEEN 1.0 AND 50000000.0
-                GROUP BY norm_candidate_name, stance
-                ORDER BY total_amount DESC; \
+                    super_pac_name,
+                    cycle,
+                    ROUND(SUM(CASE WHEN stance = 'SUPPORT' THEN total_amount ELSE 0 END), 2) AS total_support_spending,
+                    ROUND(SUM(CASE WHEN stance = 'OPPOSE' THEN total_amount ELSE 0 END), 2) AS total_oppose_spending,
+                    ROUND(SUM(total_amount), 2) AS total_independent_expenditures,
+                    COUNT(DISTINCT fec_candidate_id) AS candidates_targeted,
+                    ARG_MAX(candidate_name, total_amount) AS top_target_candidate,
+                    ROUND(MAX(total_amount), 2) AS top_target_amount
+                FROM main.super_pac_targets
+                WHERE cycle = ?
+                GROUP BY super_pac_name, cycle
+                ORDER BY total_independent_expenditures DESC
+                    LIMIT ?; \
                 """
-        results = conn.execute(query, [norm_input_name, cycle]).fetchall()
+        results = conn.execute(query, [cycle, limit]).fetchall()
 
-        targets = [
-            {
-                "candidate_name": row[0],
-                "stance": row[1],
-                "amount": float(row[2])
-            }
+        items = [
+            SuperPacImpactItem(
+                super_pac_name=row[0],
+                cycle=row[1],
+                total_support_spending=float(row[2]),
+                total_oppose_spending=float(row[3]),
+                total_independent_expenditures=float(row[4]),
+                candidates_targeted=int(row[5]),
+                top_target_candidate=row[6],
+                top_target_amount=float(row[7]) if row[7] is not None else None
+            )
             for row in results
         ]
 
-        payload = {"super_pac_name": norm_input_name, "targets": targets}
+        payload = SuperPacImpactResponse(
+            cycle=cycle,
+            total_count=len(items),
+            super_pacs=items
+        )
 
         try:
-            cache.set(cache_key, json.dumps(jsonable_encoder(payload)), ex_seconds=CACHE_TTL_24)
+            cache.set(
+                cache_key,
+                json.dumps(jsonable_encoder(payload)),
+                ex_seconds=86400
+            )
         except Exception as err:
             logger.warning(f"Redis write error for key {cache_key}: {err}")
 
         return payload
+
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to retrieve Super PAC targets: {str(e)}"
+            detail=f"Failed to retrieve Super PAC impact analytics: {str(e)}"
         )
     finally:
         if conn:
