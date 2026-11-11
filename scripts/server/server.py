@@ -1156,9 +1156,9 @@ def get_politician_by_id(politician_id: str):
     cache_key = f"member:profile:{politician_id}"
 
     # 1. Check Redis Cache
-    cached_data = cache.get(cache_key)
-    if cached_data is not None:
-        return cached_data
+    # cached_data = cache.get(cache_key)
+    # if cached_data is not None:
+    #     return cached_data
 
     # 2. Cache Miss -> Query DuckDB
     conn = get_db_cursor()
@@ -1202,56 +1202,85 @@ def get_politician_by_id(politician_id: str):
     finally:
         conn.close()
 
-@app.get("/api/politicians/{politician_id}/donors")
-def get_politician_donors(politician_id: str, cycle: Optional[int] = None):
-    """Fetch cached OpenFEC top contributors for a politician."""
+@app.get(
+    "/api/politicians/{politician_id}/donors",
+    response_model=List[Dict[str, Any]],
+    summary="Get Top Donors for a Specific Politician"
+)
+def get_politician_donors(politician_id: str, cycle: Optional[int] = Query(None, description="FEC Election Cycle")):
+    """Fetch top itemized contributors for a politician."""
     cache_key = f"fec:donors:{politician_id}"
     if cycle is not None:
         cache_key += f":cycle_{cycle}"
 
     # 1. Try Redis Cache
-    cached_data = cache.get(cache_key)
-    if cached_data is not None:
-        return cached_data
+    try:
+        cached_data = cache.get(cache_key)
+        if cached_data is not None:
+            if isinstance(cached_data, (bytes, bytearray)):
+                cached_data = cached_data.decode("utf-8")
+            return json.loads(cached_data) if isinstance(cached_data, str) else cached_data
+    except Exception as err:
+        logger.warning(f"Redis read failure for key {cache_key}: {err}")
 
-    # 2. Cache Miss -> Query DuckDB
+    # 2. Database Fetch Path (DuckDB)
     conn = get_db_cursor()
     try:
-        donor_table = conn.execute("""
+        # Verify table existence against the actual table used in the query
+        table_check = conn.execute("""
                                    SELECT COUNT(*)
                                    FROM information_schema.tables
                                    WHERE table_schema = 'main' AND table_name = 'politician_top_donors'
                                    """).fetchone()[0]
-        if not donor_table:
+
+        if not table_check:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Donor data is not available; run the OpenFEC donor ingestion first.",
+                detail="Donor data is not available; run the donor ingestion pipeline first.",
             )
 
+        # Build SQL query on the correct table
         sql = """
-              SELECT donor_name AS donorName, amount, industry, cycle
-              FROM main.stg_fec_donors
-              WHERE politician_id = ? 
+              SELECT
+                  donor_name AS donorName,
+                  amount,
+                  industry,
+                  cycle
+              FROM main.politician_top_donors
+              WHERE politician_id = ? \
               """
         params = [politician_id]
+
         if cycle is not None:
             sql += " AND cycle = ?"
-            params.append(str(cycle))
+            params.append(cycle)  # Pass integer directly to match schema
+
         sql += " ORDER BY amount DESC, donor_name ASC LIMIT 5"
 
         records = conn.execute(sql, params).fetchdf().to_dict(orient="records")
 
-        cache.set(cache_key, records, ex_seconds=86400)
+        # 3. Write to Cache
+        try:
+            cache.set(
+                cache_key,
+                json.dumps(jsonable_encoder(records)),
+                ex_seconds=86400
+            )
+        except Exception as err:
+            logger.warning(f"Redis write failure for key {cache_key}: {err}")
 
         return records
+
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Donor Query Error: {str(e)}"
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Donor Query Error: {str(e)}"
         )
     finally:
-        conn.close()
+        if conn:
+            conn.close()
 
 
 @app.get("/api/politicians/{politician_id}/donations/summary")
