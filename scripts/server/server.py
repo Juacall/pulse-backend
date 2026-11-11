@@ -822,6 +822,11 @@ def get_seat_detail(seat_id: str):
         else:
             clean_seat_id = seat_id.upper().strip()
 
+        cache_key = f"seat:detail:{clean_seat_id}"
+        cached_seat = cache.get(cache_key)
+        if cached_seat is not None:
+            return cached_seat
+
         # 1. Fetch seat metadata and current active incumbent
         seat_query = """
                      SELECT
@@ -880,7 +885,7 @@ def get_seat_detail(seat_id: str):
             for r in history_rows
         ]
 
-        return {
+        payload = {
             "seat_id": seat_row[0],
             "state_code": seat_row[1],
             "chamber": seat_row[2],
@@ -896,6 +901,8 @@ def get_seat_detail(seat_id: str):
             } if seat_row[5] else None,
             "tenure_history": history
         }
+        cache.set(cache_key, payload, ex_seconds=CACHE_TTL_24)
+        return payload
     finally:
         conn.close()
 
@@ -2375,6 +2382,11 @@ def get_state_incumbent_vs_challenger_donations(state: str):
 # Target Candidate details for a specific Super PAC
 @app.get("/api/analytics/super-pacs/{super_pac_name}/targets")
 def get_super_pac_targets(super_pac_name: str, cycle: str = "2026"):
+    cache_key = f"analytics:super_pacs:targets:{cycle}:{super_pac_name.strip().lower()}"
+    cached_targets = cache.get(cache_key)
+    if cached_targets is not None:
+        return cached_targets
+
     conn = get_db_cursor()
     try:
         # Trim and normalize both sides of the comparison
@@ -2400,12 +2412,19 @@ def get_super_pac_targets(super_pac_name: str, cycle: str = "2026"):
             }
             for row in results
         ]
-        return {"super_pac_name": super_pac_name, "targets": targets}
+        payload = {"super_pac_name": super_pac_name, "targets": targets}
+        cache.set(cache_key, payload, ex_seconds=CACHE_TTL_24)
+        return payload
     finally:
         conn.close()
 
 @app.get("/api/analytics/donations/by-state/{state_code}/candidates")
 def get_candidates_by_state(state_code: str):
+    cache_key = f"analytics:donations:by-state-candidates:{state_code.strip().upper()}"
+    cached_candidates = cache.get(cache_key)
+    if cached_candidates is not None:
+        return cached_candidates
+
     conn = get_db_cursor()
     try:
         query = """
@@ -2442,7 +2461,9 @@ def get_candidates_by_state(state_code: str):
             }
             for row in results
         ]
-        return {"state": state_code.upper(), "candidates": candidates}
+        payload = {"state": state_code.upper(), "candidates": candidates}
+        cache.set(cache_key, payload, ex_seconds=CACHE_TTL_24)
+        return payload
     finally:
         conn.close()
 # ------------------------------------------------------------------
