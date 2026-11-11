@@ -1156,9 +1156,9 @@ def get_politician_by_id(politician_id: str):
     cache_key = f"member:profile:{politician_id}"
 
     # 1. Check Redis Cache
-    # cached_data = cache.get(cache_key)
-    # if cached_data is not None:
-    #     return cached_data
+    cached_data = cache.get(cache_key)
+    if cached_data is not None:
+        return cached_data
 
     # 2. Cache Miss -> Query DuckDB
     conn = get_db_cursor()

@@ -11,8 +11,8 @@ load_project_environment()
 
 logger = logging.getLogger("uvicorn.error")
 REDIS_TIMEOUT_SECONDS = 2.0
-# Unset ENV falls back to "dev" so a misconfigured environment can never touch prod keys
-ENV = (os.getenv("ENV") or "dev").strip().lower()
+# Unset ENV falls back to "prod"; set ENV explicitly in every non-prod environment
+ENV = (os.getenv("ENV") or "prod").strip().lower()
 
 
 def env_key(key: str) -> str:

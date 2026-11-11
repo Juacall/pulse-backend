@@ -12,7 +12,7 @@ logger = logging.getLogger("uvicorn.error")
 
 LOCAL_DB_PATH = Path(__file__).resolve().parents[2] / "dev.duckdb"
 MOTHERDUCK_DB_NAME = os.getenv("MOTHERDUCK_DB_NAME")
-ENV = os.getenv("ENV")
+ENV = (os.getenv("ENV") or "prod").strip().lower()
 _logged_targets: set[str] = set()
 
 
