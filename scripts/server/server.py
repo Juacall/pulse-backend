@@ -907,76 +907,62 @@ def get_seat_detail(seat_id: str):
     finally:
         conn.close()
 
-@app.get("/api/politicians/list", dependencies=[Depends(standard_limiter)])
-def get_politicians_list(
+def _query_politicians(
+        search_query: Optional[str] = None,
         state: Optional[str] = None,
-        limit: Optional[int] = Query(None, ge=1, le=500),
-):
-    """
-    Returns politicians for state-based client caching:
-    - If `state` is ALL/None: returns top 50 incumbents for initial dashboard render.
-    - If `state` is provided (e.g., 'CA'): returns the full state dataset for local UI filtering.
-    """
-    clean_state = state.strip().upper() if state and state.upper() != "ALL" else None
-
-    # Apply limit of 50 only when requesting 'ALL' states
-    effective_limit = limit if limit is not None else (None if clean_state else 50)
-
-    # Bump cache version key to invalidate stale payloads lacking votesWithParty
-    cache_key = f"politicians:list:v5:{clean_state or 'ALL'}:{effective_limit or 'unlimited'}"
-
-    try:
-        cached_data = cache.get(cache_key)
-        if cached_data:
-            return json.loads(cached_data) if isinstance(cached_data, (str, bytes)) else cached_data
-    except Exception:
-        pass  # Fallback to DB query on cache error
-
+        chamber: Optional[str] = None,
+        party: Optional[str] = None,
+        status_filter: Optional[str] = None,
+        limit: Optional[int] = None,
+) -> list[dict]:
+    """Shared internal helper to query fsm_politician_overview and attach sentiment stats."""
     conn = get_db_cursor()
     where_clauses = ["1=1"]
     params = []
 
-    if clean_state:
-        where_clauses.append("p.state = ?")
-        params.append(clean_state)
+    if search_query:
+        where_clauses.append("LOWER(name) LIKE LOWER(?)")
+        params.append(f"%{search_query.strip()}%")
+
+    if state:
+        where_clauses.append("state = ?")
+        params.append(state.strip().upper())
+
+    if chamber:
+        normalized_chamber = CHAMBER_ALIASES.get(chamber.strip().casefold())
+        if normalized_chamber:
+            where_clauses.append("LOWER(TRIM(chamber)) = ?")
+            params.append(normalized_chamber)
+
+    if party:
+        where_clauses.append("LOWER(TRIM(party)) = LOWER(?)")
+        params.append(party.strip())
+
+    if status_filter:
+        target = status_filter.strip().lower()
+        if target == "incumbent":
+            where_clauses.append("(isIncumbent = TRUE OR LOWER(status) = 'incumbent')")
+        elif target == "challenger":
+            where_clauses.append("(LOWER(status) = 'challenger' OR isIncumbent = FALSE OR LOWER(status) = 'candidate')")
+        elif target == "open":
+            where_clauses.append("LOWER(status) IN ('open', 'open_seat')")
 
     where_sql = " AND ".join(where_clauses)
 
     sql = f"""
         SELECT 
-            p.id                        AS id,
-            p.name                      AS name,
-            p.state                     AS state,
-            p.chamber                   AS chamber,
-            p.district                  AS district,
-            p.party                     AS party,
-            p.website                   AS website,
-            p.campaign                  AS campaign,
-            COALESCE(p.imageUrl)        AS imageUrl,
-            p.is_incumbent              AS isIncumbent,
-            p.status                    AS status,    
-            COALESCE(p.sponsored_count, 0)   AS sponsoredCount,
-            COALESCE(p.cosponsored_count, 0) AS cosponsoredCount,
-            COALESCE(p.enacted_count, 0)     AS enactedCount,
-            p.pass_rate                 AS passRate,
-            COALESCE(p.total_receipts, 0.0)  AS totalReceipts,
-            p.first_file_date           AS firstFileDate,
-            att.total_eligible_votes    AS rc_total,
-            att.missed_votes            AS rc_missed,
-            att.present_abstain_votes   AS rc_present,
-            pl.party_loyalty_pct        AS votesWithParty
-        FROM main.dim_politicians AS p
-        LEFT JOIN main.mart_member_attendance AS att
-            ON p.bioguide_id = att.member_id AND p.is_incumbent = TRUE
-        LEFT JOIN main.mart_party_loyalty AS pl
-            ON p.bioguide_id = pl.member_id AND p.is_incumbent = TRUE
+            id, name, state, chamber, district, party, website, campaign,
+            imageUrl, isIncumbent, status, sponsoredCount, cosponsoredCount,
+            enactedCount, passRate, totalReceipts, firstFileDate,
+            rollCallVotes, votesWithParty
+        FROM main.fsm_politician_overview
         WHERE {where_sql}
-        ORDER BY p.is_incumbent DESC, p.name ASC
+        ORDER BY isIncumbent DESC, name ASC
     """
 
-    if effective_limit:
+    if limit is not None:
         sql += " LIMIT ?"
-        params.append(effective_limit)
+        params.append(limit)
 
     try:
         df = conn.execute(sql, params).fetchdf()
@@ -985,48 +971,39 @@ def get_politicians_list(
 
         for record in records:
             p_id = record["id"]
-            total = record.pop("rc_total", None)
-            missed = record.pop("rc_missed", None)
-            present = record.pop("rc_present", None)
-
-            if total and total > 0:
-                votes_cast = total - (missed or 0)
-                record["rollCallVotes"] = {
-                    "totalVotes": total,
-                    "votesCast": votes_cast,
-                    "missedVotes": missed or 0,
-                    "presentVotes": present or 0,
-                    "attendancePercentage": round((votes_cast / total) * 100.0, 2),
-                }
-            else:
-                record["rollCallVotes"] = None
-
-            if record.get("firstFileDate"):
-                record["firstFileDate"] = str(record["firstFileDate"])
-
             stats = sentiment_vote_map.get(p_id, {"approve": 0, "disapprove": 0, "neutral": 0})
             stats["totalVotes"] = stats["approve"] + stats["disapprove"] + stats["neutral"]
             record["sentimentStats"] = stats
 
-            # Format votesWithParty to 1 decimal place or integer
-            raw_loyalty = record.get("votesWithParty")
-            if raw_loyalty is not None:
-                record["votesWithParty"] = round(float(raw_loyalty), 1)
+        return records
+    finally:
+        conn.close()
 
+@app.get("/api/politicians/list")
+def get_politicians_list(
+        state: Optional[str] = None,
+        limit: Optional[int] = Query(None, ge=1, le=500),
+):
+    clean_state = state.strip().upper() if state and state.upper() != "ALL" else None
+    effective_limit = limit if limit is not None else (None if clean_state else 50)
+    cache_key = f"politicians:list:v7:{clean_state or 'ALL'}:{effective_limit or 'unlimited'}"
+
+    try:
+        cached_data = cache.get(cache_key)
+        if cached_data:
+            return json.loads(cached_data) if isinstance(cached_data, (str, bytes)) else cached_data
+    except Exception:
+        pass
+
+    try:
+        records = _query_politicians(state=clean_state, limit=effective_limit)
         try:
             cache.set(cache_key, json.dumps(records), ex=86400)
         except Exception:
             pass
-
         return records
-
     except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Database Query Error: {str(e)}"
-        )
-    finally:
-        conn.close()
+        raise HTTPException(status_code=500, detail=f"Database Query Error: {str(e)}")
 
 
 @app.get("/api/politicians/search", dependencies=[Depends(search_limiter)])
@@ -1038,118 +1015,17 @@ def search_politicians(
         candidate_status: Optional[str] = Query(None, alias="status"),
         limit: int = Query(50, ge=1, le=200),
 ):
-    """Executes a targeted search query across all candidates with active filter parameters."""
-    normalized_chamber = CHAMBER_ALIASES.get((chamber or "").strip().casefold())
-    clean_search = q.strip()
-    clean_party = party.strip() if party and party.upper() != "ALL" else None
-    clean_state = state.strip().upper() if state and state.upper() != "ALL" else None
-    clean_status = candidate_status.strip() if candidate_status and candidate_status.upper() != "ALL" else None
-
-    conn = get_db_cursor()
-
-    where_clauses = ["LOWER(p.name) LIKE LOWER(?)"]
-    params = [f"%{clean_search}%"]
-
-    if clean_state:
-        where_clauses.append("p.state = ?")
-        params.append(clean_state)
-
-    if normalized_chamber:
-        where_clauses.append("LOWER(TRIM(p.chamber)) = ?")
-        params.append(normalized_chamber)
-
-    if clean_party:
-        where_clauses.append("LOWER(TRIM(p.party)) = LOWER(?)")
-        params.append(clean_party)
-
-    if clean_status:
-        target_status = clean_status.lower()
-        if target_status == "incumbent":
-            where_clauses.append("(p.is_incumbent = TRUE OR LOWER(p.status) = 'incumbent')")
-        elif target_status == "challenger":
-            where_clauses.append("(LOWER(p.status) = 'challenger' OR (p.is_incumbent = FALSE OR LOWER(p.status) = 'candidate'))")
-        elif target_status == "open":
-            where_clauses.append("LOWER(p.status) IN ('open', 'open_seat')")
-
-    where_sql = " AND ".join(where_clauses)
-
-    sql = f"""
-        SELECT 
-            p.id                        AS id,
-            p.name                      AS name,
-            p.state                     AS state,
-            p.chamber                   AS chamber,
-            p.district                  AS district,
-            p.party                     AS party,
-            p.website                   AS website,
-            p.campaign                  AS campaign,
-            COALESCE(p.imageUrl)        AS imageUrl,
-            p.is_incumbent              AS isIncumbent,
-            p.status                    AS status,    
-            COALESCE(p.sponsored_count, 0)   AS sponsoredCount,
-            COALESCE(p.cosponsored_count, 0) AS cosponsoredCount,
-            COALESCE(p.enacted_count, 0)     AS enactedCount,
-            p.pass_rate                 AS passRate,
-            COALESCE(p.total_receipts, 0.0)  AS totalReceipts,
-            p.first_file_date           AS firstFileDate,
-            att.total_eligible_votes    AS rc_total,
-            att.missed_votes            AS rc_missed,
-            att.present_abstain_votes   AS rc_present,
-            pl.party_loyalty_pct        AS votesWithParty
-        FROM main.dim_politicians AS p
-        LEFT JOIN main.mart_member_attendance AS att
-            ON p.bioguide_id = att.member_id AND p.is_incumbent = TRUE
-        LEFT JOIN main.mart_party_loyalty AS pl
-            ON p.bioguide_id = pl.member_id AND p.is_incumbent = TRUE
-        WHERE {where_sql}
-        ORDER BY p.is_incumbent DESC, p.name ASC
-        LIMIT ?;
-    """
-    params.append(limit)
-
     try:
-        df = conn.execute(sql, params).fetchdf()
-        records = df.astype(object).where(df.notna(), None).to_dict(orient="records")
-        sentiment_vote_map = fetch_vote_aggregates_from_supabase()
-
-        for record in records:
-            p_id = record["id"]
-            total = record.pop("rc_total", None)
-            missed = record.pop("rc_missed", None)
-            present = record.pop("rc_present", None)
-
-            if total and total > 0:
-                votes_cast = total - (missed or 0)
-                record["rollCallVotes"] = {
-                    "totalVotes": total,
-                    "votesCast": votes_cast,
-                    "missedVotes": missed or 0,
-                    "presentVotes": present or 0,
-                    "attendancePercentage": round((votes_cast / total) * 100.0, 2),
-                }
-            else:
-                record["rollCallVotes"] = None
-
-            if record.get("firstFileDate"):
-                record["firstFileDate"] = str(record["firstFileDate"])
-
-            stats = sentiment_vote_map.get(p_id, {"approve": 0, "disapprove": 0, "neutral": 0})
-            stats["totalVotes"] = stats["approve"] + stats["disapprove"] + stats["neutral"]
-            record["sentimentStats"] = stats
-
-            # Format votesWithParty to 1 decimal place or integer
-            raw_loyalty = record.get("votesWithParty")
-            if raw_loyalty is not None:
-                record["votesWithParty"] = round(float(raw_loyalty), 1)
-        return records
-
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Database Query Error: {str(e)}"
+        return _query_politicians(
+            search_query=q,
+            state=state if state and state.upper() != "ALL" else None,
+            chamber=chamber,
+            party=party if party and party.upper() != "ALL" else None,
+            status_filter=candidate_status if candidate_status and candidate_status.upper() != "ALL" else None,
+            limit=limit,
         )
-    finally:
-        conn.close()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database Query Error: {str(e)}")
 
 @app.get("/api/politicians/{politician_id}", dependencies=[Depends(standard_limiter)])
 def get_politician_by_id(politician_id: str):
