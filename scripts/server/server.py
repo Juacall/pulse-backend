@@ -243,6 +243,22 @@ class SuperPacImpactResponse(BaseModel):
     total_count: int
     super_pacs: List[SuperPacImpactItem]
 
+
+class SuperPacTargetCandidate(BaseModel):
+    fec_candidate_id: Optional[str] = None
+    candidate_name: str
+    support_amount: float
+    oppose_amount: float
+    total_amount: float
+    transaction_count: int
+
+
+class SuperPacTargetsResponse(BaseModel):
+    super_pac_name: str
+    cycle: str
+    total_count: int
+    targets: List[SuperPacTargetCandidate]
+
 # Enable CORS for Vite dev server (and production domains)
 app.add_middleware(
     CORSMiddleware,
@@ -536,6 +552,7 @@ def track_click(
 # AUTH ENDPOINTS
 # -------------------------------------------------------------------
 @app.get("/api/usersummary",response_model=UserSummaryResponse)
+@app.get("/api/votes/usersummary",response_model=UserSummaryResponse)
 def get_user_summary(current_user: str = Depends(get_current_user)):
     """
     Returns user profile, Stripe verification status, and a mapping of
@@ -1344,98 +1361,6 @@ def chat_with_agent(request: ChatRequest):
 # -------------------------------------------------------------------
 # Vote Endpoints
 # -------------------------------------------------------------------
-@app.get("/api/votes/usersummary",response_model=UserSummaryResponse)
-def get_user_summary(current_user: str = Depends(get_current_user)):
-    """
-    Returns user profile, Stripe verification status, and a mapping of
-    politician_id -> vote_type for the authenticated user.
-    Leverages Redis caching for fast state hydration on app load.
-    """
-    user_id = current_user
-    if not user_id:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="User identity could not be verified."
-        )
-    cache_key = f"user:{user_id}:summary"
-
-    # 1. Check Redis Cache First
-    try:
-        cached_data = cache.get(cache_key)
-        if cached_data:
-            if isinstance(cached_data, (bytes, bytearray)):
-                cached_data = cached_data.decode("utf-8")
-            return json.loads(cached_data) if isinstance(cached_data, str) else cached_data
-    except Exception as err:
-        logger.warning(f"Redis read error for user summary (user_id={user_id}): {err}")
-
-    # 2. Query Supabase (Profile Verification & User Votes)
-    try:
-        # Fetch profile verification data
-        profile_res = (
-            supabase.table("profiles")
-            .select("is_identity_verified, stripe_verification_id")
-            .eq("id", user_id)
-            .single()
-            .execute()
-        )
-
-        # Fetch voting history
-        votes_res = (
-            supabase.table("user_votes")
-            .select("politician_id, vote_type")
-            .eq("user_id", user_id)
-            .execute()
-        )
-        profile_data = profile_res.data or {}
-        raw_votes = votes_res.data or []
-
-        is_verified = profile_data.get("is_identity_verified", False)
-        stripe_verification_id = profile_data.get("stripe_verification_id")
-
-        # 3. Stripe Self-Healing Check
-        # If DB status is False but a Stripe session exists, verify status directly with Stripe
-        if stripe_verification_id and not is_verified:
-            try:
-                session = stripe.identity.VerificationSession.retrieve(stripe_verification_id)
-                if session.get("status") == "verified":
-                    is_verified = True
-                    # Sync updated state back to Supabase
-                    supabase.table("profiles").update(
-                        {"is_identity_verified": True}
-                    ).eq("id", user_id).execute()
-            except stripe.error.StripeError as stripe_err:
-                logger.error(f"Failed to check Stripe verification status for session {stripe_verification_id}: {stripe_err}")
-
-        # Construct vote map: { "politician_id_123": "YEA", "politician_id_456": "NAY" }
-        vote_map = {row["politician_id"]: row["vote_type"] for row in raw_votes}
-
-        # Build payload
-        summary_payload = {
-            "user_id": user_id,
-            "is_identity_verified": is_verified,
-            "stripe_verification_id": stripe_verification_id,
-            "votes_map": vote_map
-        }
-
-        # 4. Write back to Redis Cache
-        try:
-            cache.set(
-                cache_key,
-                json.dumps(summary_payload),
-                ex_seconds=CACHE_TTL_USER_VOTES
-            )
-        except Exception as err:
-            logger.warning(f"Redis write error for user summary (user_id={user_id}): {err}")
-
-        return summary_payload
-
-    except Exception as e:
-        logger.error(f"Failed to fetch user summary for user_id={user_id}: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to retrieve user voting and verification records: {str(e)}"
-        )
 
 @app.get("/api/politicians/{politician_id}/roll-call-votes")
 def get_official_roll_call_votes(politician_id: str):
@@ -1699,96 +1624,6 @@ def get_state_elections(
 # -------------------------------------------------------------------
 # Analytics Endpoints
 # -------------------------------------------------------------------
-
-@app.get(
-    "/api/analytics/super-pacs/impact",
-    response_model=SuperPacImpactResponse,
-    summary="Get Super PAC Independent Expenditure Impact Analysis"
-)
-def get_super_pac_impact(
-        cycle: str = Query("2026", description="FEC Election Cycle"),
-        limit: int = Query(50, ge=1, le=500, description="Number of Super PACs to return")
-):
-    conn = None
-    cache_key = f"analytics:super_pacs:impact:{cycle}:limit_{limit}"
-
-    # 1. Redis Cache Read
-    try:
-        cached_payload = cache.get(cache_key)
-        if cached_payload:
-            if isinstance(cached_payload, (bytes, bytearray)):
-                cached_payload = cached_payload.decode("utf-8")
-            data = json.loads(cached_payload) if isinstance(cached_payload, str) else cached_payload
-            return SuperPacImpactResponse(**data)
-    except Exception as err:
-        logger.warning(f"Redis read error for key {cache_key}: {err}")
-
-    # 2. Database Read (DuckDB)
-    try:
-        conn = get_db_cursor()
-
-        # Aggregates by normalized super_pac_name, filters out non-committee filers, & excludes >$50M outliers
-        query = """
-                SELECT
-                    REGEXP_REPLACE(UPPER(TRIM(super_pac_name)), '\\s+', ' ', 'g') AS norm_pac_name,
-                    cycle,
-                    ROUND(SUM(CASE WHEN stance = 'SUPPORT' THEN amount ELSE 0 END), 2) AS total_support_spending,
-                    ROUND(SUM(CASE WHEN stance = 'OPPOSE' THEN amount ELSE 0 END), 2) AS total_oppose_spending,
-                    ROUND(SUM(amount), 2) AS total_independent_expenditures,
-                    COUNT(DISTINCT fec_candidate_id) AS candidates_targeted,
-                    ARG_MAX(candidate_name, amount) AS top_target_candidate,
-                    ROUND(MAX(amount), 2) AS top_target_amount
-                FROM main.stg_fec_independent_expenditures
-                WHERE cycle = ?
-                  AND super_pac_id LIKE 'C%'
-                  AND amount BETWEEN 1.0 AND 50000000.0
-                GROUP BY norm_pac_name, cycle
-                ORDER BY total_independent_expenditures DESC
-                    LIMIT ?; \
-                """
-        results = conn.execute(query, [cycle, limit]).fetchall()
-
-        items = [
-            SuperPacImpactItem(
-                super_pac_name=row[0],
-                cycle=row[1],
-                total_support_spending=float(row[2]),
-                total_oppose_spending=float(row[3]),
-                total_independent_expenditures=float(row[4]),
-                candidates_targeted=int(row[5]),
-                top_target_candidate=row[6],
-                top_target_amount=float(row[7]) if row[7] is not None else None
-            )
-            for row in results
-        ]
-
-        payload = SuperPacImpactResponse(
-            cycle=cycle,
-            total_count=len(items),
-            super_pacs=items
-        )
-
-        # 3. Redis Cache Write (24-Hour TTL)
-        try:
-            cache.set(
-                cache_key,
-                json.dumps(jsonable_encoder(payload)),
-                ex_seconds=CACHE_TTL_24
-            )
-        except Exception as err:
-            logger.warning(f"Redis write error for key {cache_key}: {err}")
-
-        return payload
-
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to retrieve Super PAC impact analytics: {str(e)}"
-        )
-    finally:
-        if conn:
-            conn.close()
-
 
 # Target Candidate details for a specific Super PAC
 @app.get(
@@ -2063,25 +1898,20 @@ def get_donations_by_state(
         conn = get_db_cursor()
         query = """
                 SELECT
-                    p.state,
-                    COUNT(DISTINCT s.politician_id) AS candidate_count,
-                    ROUND(COALESCE(SUM(s.individual_unitemized), 0.0), 2) AS total_grassroots_dollars,
-                    ROUND(COALESCE(SUM(s.individual_itemized), 0.0), 2) AS total_large_donor_dollars,
-                    ROUND(COALESCE(SUM(s.pac_contributions), 0.0), 2) AS total_pac_dollars,
-                    ROUND(COALESCE(SUM(s.total_receipts), 0.0), 2) AS total_receipts_dollars,
-                    ROUND(
-                            COALESCE(
-                                    (SUM(s.individual_unitemized) / NULLIF(SUM(s.total_receipts), 0.0)) * 100,
-                                    0.0
-                            ), 2
-                    ) AS grassroots_pct
-                FROM main.politician_fec_summary s
-                         JOIN main.dim_politicians p ON s.politician_id = p.id
-                WHERE p.state IS NOT NULL AND p.state != ''
-                GROUP BY p.state
+                    state,
+                    COUNT(DISTINCT politician_id) AS candidate_count,
+                    ROUND(SUM(grassroots_dollars), 2) AS total_grassroots_dollars,
+                    ROUND(SUM(large_donor_dollars), 2) AS total_large_donor_dollars,
+                    ROUND(SUM(pac_dollars), 2) AS total_pac_dollars,
+                    ROUND(SUM(total_receipts), 2) AS total_receipts_dollars,
+                    ROUND(COALESCE((SUM(grassroots_dollars) / NULLIF(SUM(total_receipts), 0.0)) * 100, 0.0), 2) AS grassroots_pct
+                FROM main.mart_politician_financials
+                WHERE has_fec_filing = TRUE
+                  AND state IS NOT NULL AND state != ''
+                GROUP BY state
                 HAVING total_receipts_dollars >= ?
                 ORDER BY total_receipts_dollars DESC
-                    LIMIT ?; \
+                    LIMIT ?;
                 """
         rows = conn.execute(query, [min_receipts, limit]).fetchall()
 
@@ -2145,22 +1975,17 @@ def get_incumbent_vs_challenger_donations():
         conn = get_db_cursor()
         query = """
                 SELECT
-                    CASE WHEN p.is_incumbent THEN 'Incumbents' ELSE 'Challengers' END AS category,
-                    COUNT(DISTINCT s.politician_id) AS candidate_count,
-                    ROUND(COALESCE(SUM(s.individual_unitemized), 0.0), 2) AS total_grassroots_dollars,
-                    ROUND(COALESCE(SUM(s.individual_itemized), 0.0), 2) AS total_large_donor_dollars,
-                    ROUND(COALESCE(SUM(s.pac_contributions), 0.0), 2) AS total_pac_dollars,
-                    ROUND(COALESCE(SUM(s.total_receipts), 0.0), 2) AS total_receipts_dollars,
-                    ROUND(
-                            COALESCE(
-                                    (SUM(s.individual_unitemized) / NULLIF(SUM(s.total_receipts), 0.0)) * 100,
-                                    0.0
-                            ), 2
-                    ) AS avg_grassroots_pct
-                FROM main.politician_fec_summary s
-                         JOIN main.dim_politicians p ON s.politician_id = p.id
-                GROUP BY p.is_incumbent
-                ORDER BY p.is_incumbent DESC; \
+                    CASE WHEN is_incumbent THEN 'Incumbents' ELSE 'Challengers' END AS category,
+                    COUNT(DISTINCT politician_id) AS candidate_count,
+                    ROUND(SUM(grassroots_dollars), 2) AS total_grassroots_dollars,
+                    ROUND(SUM(large_donor_dollars), 2) AS total_large_donor_dollars,
+                    ROUND(SUM(pac_dollars), 2) AS total_pac_dollars,
+                    ROUND(SUM(total_receipts), 2) AS total_receipts_dollars,
+                    ROUND(COALESCE((SUM(grassroots_dollars) / NULLIF(SUM(total_receipts), 0.0)) * 100, 0.0), 2) AS avg_grassroots_pct
+                FROM main.mart_politician_financials
+                WHERE has_fec_filing = TRUE
+                GROUP BY is_incumbent
+                ORDER BY is_incumbent DESC;
                 """
         rows = conn.execute(query).fetchall()
 
@@ -2229,20 +2054,19 @@ def get_district_donation_summary(
         conn = get_db_cursor()
         query = """
                 SELECT
-                    p.id AS politician_id,
-                    p.name AS politician_name,
-                    p.party,
-                    p.is_incumbent,
-                    ROUND(COALESCE(s.total_receipts, 0.0), 2) AS total_receipts,
-                    ROUND(COALESCE(s.individual_unitemized, 0.0), 2) AS grassroots_contributions,
-                    ROUND(COALESCE(s.individual_itemized, 0.0), 2) AS large_donor_contributions,
-                    ROUND(COALESCE(s.pac_contributions, 0.0), 2) AS pac_contributions,
-                    ROUND(COALESCE(s.grassroots_percentage, 0.0), 2) AS grassroots_percentage,
-                    s.coverage_end_date
-                FROM main.dim_politicians p
-                         LEFT JOIN main.politician_fec_summary s ON p.id = s.politician_id
-                WHERE UPPER(p.state) = UPPER(?) AND p.district = ?
-                ORDER BY total_receipts DESC; \
+                    politician_id,
+                    politician_name,
+                    party,
+                    is_incumbent,
+                    total_receipts,
+                    grassroots_dollars AS grassroots_contributions,
+                    large_donor_dollars AS large_donor_contributions,
+                    pac_dollars AS pac_contributions,
+                    grassroots_pct AS grassroots_percentage,
+                    coverage_end_date
+                FROM main.mart_politician_financials
+                WHERE state = UPPER(?) AND district = ?
+                ORDER BY total_receipts DESC;
                 """
         rows = conn.execute(query, [clean_state, district]).fetchall()
 
@@ -2320,24 +2144,19 @@ def get_state_incumbent_vs_challenger_donations(state: str):
         conn = get_db_cursor()
         query = """
                 SELECT
-                    UPPER(p.state) AS state,
-                    CASE WHEN p.is_incumbent THEN 'Incumbents' ELSE 'Challengers' END AS category,
-                    COUNT(DISTINCT s.politician_id) AS candidate_count,
-                    ROUND(COALESCE(SUM(s.individual_unitemized), 0.0), 2) AS total_grassroots_dollars,
-                    ROUND(COALESCE(SUM(s.individual_itemized), 0.0), 2) AS total_large_donor_dollars,
-                    ROUND(COALESCE(SUM(s.pac_contributions), 0.0), 2) AS total_pac_dollars,
-                    ROUND(COALESCE(SUM(s.total_receipts), 0.0), 2) AS total_receipts_dollars,
-                    ROUND(
-                            COALESCE(
-                                    (SUM(s.individual_unitemized) / NULLIF(SUM(s.total_receipts), 0.0)) * 100,
-                                    0.0
-                            ), 2
-                    ) AS grassroots_pct
-                FROM main.politician_fec_summary s
-                         JOIN main.dim_politicians p ON s.politician_id = p.id
-                WHERE UPPER(p.state) = UPPER(?)
-                GROUP BY p.state, p.is_incumbent
-                ORDER BY p.is_incumbent DESC; \
+                    state,
+                    CASE WHEN is_incumbent THEN 'Incumbents' ELSE 'Challengers' END AS category,
+                    COUNT(DISTINCT politician_id) AS candidate_count,
+                    ROUND(SUM(grassroots_dollars), 2) AS total_grassroots_dollars,
+                    ROUND(SUM(large_donor_dollars), 2) AS total_large_donor_dollars,
+                    ROUND(SUM(pac_dollars), 2) AS total_pac_dollars,
+                    ROUND(SUM(total_receipts), 2) AS total_receipts_dollars,
+                    ROUND(COALESCE((SUM(grassroots_dollars) / NULLIF(SUM(total_receipts), 0.0)) * 100, 0.0), 2) AS grassroots_pct
+                FROM main.mart_politician_financials
+                WHERE has_fec_filing = TRUE
+                  AND state = UPPER(?)
+                GROUP BY state, is_incumbent
+                ORDER BY is_incumbent DESC;
                 """
         rows = conn.execute(query, [clean_state]).fetchall()
 
@@ -2389,23 +2208,16 @@ def get_candidates_by_state(state_code: str):
     try:
         query = """
                 SELECT
-                    p.name,
-                    p.chamber AS office,
-                    p.status,
-                    p.is_incumbent,
-                    ROUND(COALESCE(SUM(s.individual_unitemized), 0.0), 2) AS total_grassroots_dollars,
-                    ROUND(COALESCE(SUM(s.individual_itemized), 0.0), 2) AS total_large_donor_dollars,
-                    ROUND(COALESCE(SUM(s.pac_contributions), 0.0), 2) AS total_pac_dollars,
-                    ROUND(COALESCE(SUM(s.total_receipts), 0.0), 2) AS total_receipts
-                FROM main.dim_politicians p
-                         LEFT JOIN main.politician_fec_summary s
-                                   ON p.fec_candidate_id = s.fec_candidate_id
-                WHERE UPPER(p.state) = UPPER(?)
-                GROUP BY
-                    p.name,
-                    p.chamber,
-                    p.status,
-                    p.is_incumbent
+                    politician_name AS name,
+                    chamber AS office,
+                    status,
+                    is_incumbent,
+                    grassroots_dollars AS total_grassroots_dollars,
+                    large_donor_dollars AS total_large_donor_dollars,
+                    pac_dollars AS total_pac_dollars,
+                    total_receipts
+                FROM main.mart_politician_financials
+                WHERE state = UPPER(?)
                 ORDER BY total_receipts DESC;
                 """
         results = conn.execute(query, [state_code]).fetchall()
@@ -2426,6 +2238,69 @@ def get_candidates_by_state(state_code: str):
         return payload
     finally:
         conn.close()
+
+
+# Target Candidate details for a specific Super PAC
+@app.get("/api/analytics/super-pacs/{super_pac_name}/targets")
+def get_super_pac_targets(super_pac_name: str, cycle: str = "2026"):
+    # Normalize input parameter for cache key
+    norm_input_name = " ".join(super_pac_name.strip().upper().split())
+    cache_key = f"analytics:super_pacs:targets:{cycle}:{norm_input_name.lower()}"
+
+    try:
+        cached_targets = cache.get(cache_key)
+        if cached_targets is not None:
+            if isinstance(cached_targets, (bytes, bytearray)):
+                cached_targets = cached_targets.decode("utf-8")
+            return json.loads(cached_targets) if isinstance(cached_targets, str) else cached_targets
+    except Exception as err:
+        logger.warning(f"Redis read error for key {cache_key}: {err}")
+
+    conn = get_db_cursor()
+    try:
+        # Match using normalized super_pac_name and candidate_name
+        query = """
+                SELECT
+                    REGEXP_REPLACE(UPPER(TRIM(candidate_name)), '\\s+', ' ', 'g') AS norm_candidate_name,
+                    stance,
+                    ROUND(SUM(amount), 2) AS total_amount
+                FROM main.stg_fec_independent_expenditures
+                WHERE REGEXP_REPLACE(UPPER(TRIM(super_pac_name)), '\\s+', ' ', 'g') = ?
+                  AND cycle = ?
+                  AND candidate_name IS NOT NULL
+                  AND super_pac_id LIKE 'C%'
+                  AND amount BETWEEN 1.0 AND 50000000.0
+                GROUP BY norm_candidate_name, stance
+                ORDER BY total_amount DESC; \
+                """
+        results = conn.execute(query, [norm_input_name, cycle]).fetchall()
+
+        targets = [
+            {
+                "candidate_name": row[0],
+                "stance": row[1],
+                "amount": float(row[2])
+            }
+            for row in results
+        ]
+
+        payload = {"super_pac_name": norm_input_name, "targets": targets}
+
+        try:
+            cache.set(cache_key, json.dumps(jsonable_encoder(payload)), ex_seconds=CACHE_TTL_24)
+        except Exception as err:
+            logger.warning(f"Redis write error for key {cache_key}: {err}")
+
+        return payload
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to retrieve Super PAC targets: {str(e)}"
+        )
+    finally:
+        if conn:
+            conn.close()
+
 # ------------------------------------------------------------------
 # Legislative Tracking Endpoints
 # ------------------------------------------------------------------
