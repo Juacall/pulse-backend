@@ -1254,6 +1254,9 @@ def get_politician_key_bills(bioguide_id: str) -> List[Dict[str, Any]]:
     if cached_data is not None:
         return cached_data
 
+
+
+
     # 2. Cache Miss -> Query DuckDB
     conn = get_db_cursor()
 
@@ -1276,6 +1279,32 @@ def get_politician_key_bills(bioguide_id: str) -> List[Dict[str, Any]]:
           """
 
     try:
+        db_ctx = conn.execute("SELECT current_database(), current_schema()").fetchone()
+        matching_tables = conn.execute("""
+                                       SELECT table_schema, table_type
+                                       FROM information_schema.tables
+                                       WHERE table_name = 'mart_legislative_activity'
+                                       """).fetchall()
+        total_rows = conn.execute(
+            "SELECT COUNT(*) FROM main.mart_legislative_activity"
+        ).fetchone()[0]
+        member_rows = conn.execute(
+            "SELECT activity_type, COUNT(*) FROM main.mart_legislative_activity "
+            "WHERE TRIM(target_member_id) = ? GROUP BY 1",
+            [bioguide_id],
+        ).fetchall()
+
+        logger.warning(
+            "[DIAG bills] member=%s target=%s active_db=%s.%s tables=%s total_main_rows=%s member_rows=%s",
+            bioguide_id,
+            database_label(DB_PATH),
+            db_ctx[0],
+            db_ctx[1],
+            matching_tables,
+            total_rows,
+            member_rows,
+        )
+
         df = conn.execute(sql, [bioguide_id]).fetchdf()
         conn.close()
 
@@ -1290,8 +1319,8 @@ def get_politician_key_bills(bioguide_id: str) -> List[Dict[str, Any]]:
         })
 
         records = df.to_dict(orient="records")
-
-        cache.set(cache_key, records, ex_seconds=43200)
+        if records:
+            cache.set(cache_key, records, ex_seconds=43200)
 
         return records
     except Exception as e:
