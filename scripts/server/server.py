@@ -1047,7 +1047,7 @@ def search_politicians(
 @app.get("/api/politicians/{politician_id}", dependencies=[Depends(standard_limiter)])
 def get_politician_by_id(politician_id: str):
     """Fetch detailed metadata for a single politician by bioguide ID."""
-    cache_key = f"member:profile:{politician_id}"
+    cache_key = f"politicians:profile:{politician_id}"
 
     # 1. Check Redis Cache
     cached_data = cache.get(cache_key)
@@ -1101,11 +1101,15 @@ def get_politician_by_id(politician_id: str):
     response_model=List[Dict[str, Any]],
     summary="Get Top Donors for a Specific Politician"
 )
-def get_politician_donors(politician_id: str, cycle: Optional[int] = Query(None, description="FEC Election Cycle")):
+def get_politician_donors(
+        politician_id: str,
+        cycle: Optional[str] = Query(None, description="FEC Election Cycle")
+):
     """Fetch top itemized contributors for a politician."""
-    cache_key = f"fec:donors:{politician_id}"
-    if cycle is not None:
-        cache_key += f":cycle_{cycle}"
+    clean_cycle = str(cycle).strip() if cycle is not None else None
+    cache_key = f"donors:{politician_id}"
+    if clean_cycle:
+        cache_key += f":cycle_{clean_cycle}"
 
     # 1. Try Redis Cache
     try:
@@ -1120,7 +1124,6 @@ def get_politician_donors(politician_id: str, cycle: Optional[int] = Query(None,
     # 2. Database Fetch Path (DuckDB)
     conn = get_db_cursor()
     try:
-        # Verify table existence against the actual table used in the query
         table_check = conn.execute("""
                                    SELECT COUNT(*)
                                    FROM information_schema.tables
@@ -1133,21 +1136,22 @@ def get_politician_donors(politician_id: str, cycle: Optional[int] = Query(None,
                 detail="Donor data is not available; run the donor ingestion pipeline first.",
             )
 
-        # Build SQL query on the correct table
         sql = """
               SELECT
                   donor_name AS donorName,
-                  amount,
+                  ROUND(amount, 2) AS amount,
                   industry,
-                  cycle
+                  cycle,
+                  donor_type AS donorType
               FROM main.politician_top_donors
-              WHERE politician_id = ? \
+              WHERE politician_id = ?
+                  
               """
         params = [politician_id]
 
-        if cycle is not None:
+        if clean_cycle:
             sql += " AND cycle = ?"
-            params.append(cycle)  # Pass integer directly to match schema
+            params.append(clean_cycle)
 
         sql += " ORDER BY amount DESC, donor_name ASC LIMIT 5"
 
@@ -1180,7 +1184,7 @@ def get_politician_donors(politician_id: str, cycle: Optional[int] = Query(None,
 @app.get("/api/politicians/{politician_id}/donations/summary")
 def get_politician_donation_summary(politician_id: str):
     """Fetch aggregate OpenFEC campaign finance totals for a politician."""
-    cache_key = f"fec:summary:{politician_id}"
+    cache_key = f"donors:summary:{politician_id}"
 
     # 1. Try Redis Cache
     cached_data = cache.get(cache_key)
@@ -2362,7 +2366,7 @@ def get_recent_bills(
         if not search_term and page == 1:
             watermark = get_bills_watermark(conn, table_name="main.mart_recent_bills", chamber=chamber)
             chamber_tag = chamber.lower() if chamber else "all"
-            cache_key = f"legipulse:recent_bills:{chamber_tag}:limit_{per_chamber_limit}:wm_{watermark}"
+            cache_key = f"bills:recent_bills:{chamber_tag}:limit_{per_chamber_limit}:wm_{watermark}"
 
             try:
                 cached_data = cache.get(cache_key)
@@ -2615,7 +2619,7 @@ def get_recently_passed_bills(
         if not search_term and page == 1:
             watermark = get_bills_watermark(conn, table_name="main.mart_recently_passed_bills", chamber=chamber)
             chamber_tag = chamber.lower() if chamber else "all"
-            cache_key = f"legipulse:passed_bills:{chamber_tag}:limit_{per_chamber_limit}:wm_{watermark}"
+            cache_key = f"bills:passed_bills:{chamber_tag}:limit_{per_chamber_limit}:wm_{watermark}"
 
             try:
                 cached_data = cache.get(cache_key)
