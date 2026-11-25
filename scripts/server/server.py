@@ -1266,7 +1266,7 @@ def get_politician_key_bills(bioguide_id: str) -> List[Dict[str, Any]]:
               CAST(bill_introduced_date AS VARCHAR) AS introducedDate,
               bill_latest_action_text AS latestAction,
               CAST(bill_latest_action_date AS VARCHAR) AS actionDate
-          FROM mart_legislative_activity
+          FROM main.mart_legislative_activity
           WHERE target_member_id = ?
             AND activity_type = 'bill'
           ORDER BY
@@ -2757,7 +2757,7 @@ def get_recently_passed_bills(
     "/api/internal/cache/invalidate",
     summary="Invalidate Redis cache keys on MotherDuck ETL pipeline update"
 )
-def invalidate_analytical_cache(
+def invalidate_cache(
         prefix: str = "analytics:",
         x_internal_token: str = Header(...)
 ):
@@ -2766,9 +2766,18 @@ def invalidate_analytical_cache(
 
     try:
         deleted_count = cache.delete_pattern(f"{prefix}*")
+        reset_db_connection()
         return {"status": "success", "keys_invalidated": deleted_count}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Cache invalidation error: {str(e)}")
+
+def reset_db_connection() -> None:
+    global _duckdb_conn, _duckdb_path
+    with _duckdb_lock:
+        if _duckdb_conn is not None:
+            _duckdb_conn.close()
+            _duckdb_conn = None
+            _duckdb_path = None
 
 if __name__ == "__main__":
     import uvicorn
