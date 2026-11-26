@@ -1254,23 +1254,20 @@ def get_politician_key_bills(bioguide_id: str) -> List[Dict[str, Any]]:
     if cached_data is not None:
         return cached_data
 
-
-
-
     # 2. Cache Miss -> Query DuckDB
     conn = get_db_cursor()
 
     sql = """
           SELECT DISTINCT
-              activity_id AS id,
-              coalesce(bill_title, activity_title) AS title,
+              bill_id AS id,
+              bill_title AS title,
               relationship AS type,
               bill_status AS statusCategory,
               CAST(bill_introduced_date AS VARCHAR) AS introducedDate,
               bill_latest_action_text AS latestAction,
               CAST(bill_latest_action_date AS VARCHAR) AS actionDate
-          FROM main.mart_legislative_activity
-          WHERE target_member_id = ?
+          FROM main.int_legislative_activity
+          WHERE member_id = ?
             AND activity_type = 'bill'
           ORDER BY
               CASE WHEN relationship = 'sponsor' THEN 1 ELSE 2 END,
@@ -1279,34 +1276,7 @@ def get_politician_key_bills(bioguide_id: str) -> List[Dict[str, Any]]:
           """
 
     try:
-        db_ctx = conn.execute("SELECT current_database(), current_schema()").fetchone()
-        matching_tables = conn.execute("""
-                                       SELECT table_schema, table_type
-                                       FROM information_schema.tables
-                                       WHERE table_name = 'mart_legislative_activity'
-                                       """).fetchall()
-        total_rows = conn.execute(
-            "SELECT COUNT(*) FROM main.mart_legislative_activity"
-        ).fetchone()[0]
-        member_rows = conn.execute(
-            "SELECT activity_type, COUNT(*) FROM main.mart_legislative_activity "
-            "WHERE TRIM(target_member_id) = ? GROUP BY 1",
-            [bioguide_id],
-        ).fetchall()
-
-        logger.warning(
-            "[DIAG bills] member=%s target=%s active_db=%s.%s tables=%s total_main_rows=%s member_rows=%s",
-            bioguide_id,
-            database_label(DB_PATH),
-            db_ctx[0],
-            db_ctx[1],
-            matching_tables,
-            total_rows,
-            member_rows,
-        )
-
         df = conn.execute(sql, [bioguide_id]).fetchdf()
-        conn.close()
 
         # Handle null values gracefully
         df = df.fillna({
@@ -1324,8 +1294,12 @@ def get_politician_key_bills(bioguide_id: str) -> List[Dict[str, Any]]:
 
         return records
     except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"DuckDB Query Error: {str(e)}"
+        )
+    finally:
         conn.close()
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"DuckDB Query Error: {str(e)}")
 # -------------------------------------------------------------------
 # RAG AGENT EXECUTION ENDPOINT
 # -------------------------------------------------------------------
